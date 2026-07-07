@@ -115,20 +115,6 @@ JitterBuffer.prototype.push = function (pkt) {
   if (!pkt) return;
   var seq = pkt.sequenceNumber;
 
-  // DIAG — log first 30 push calls to verify packet ordering and init
-  // behavior. Removed after the startup-frame-truncation hypothesis is
-  // confirmed/refuted.
-  if (this._diagPushCount === undefined) this._diagPushCount = 0;
-  if (this._diagPushCount < 30) {
-    this._diagPushCount++;
-    var inBuffer = Object.keys(this._buffer).length;
-    console.log('[jb push #' + this._diagPushCount + '] seq=' + seq +
-                ' nextSeq=' + this._nextSeq +
-                ' bufSize=' + inBuffer +
-                ' marker=' + (pkt.marker ? '1' : '0') +
-                ' ts=' + pkt.timestamp);
-  }
-
   // Initialize on first packet
   if (this._nextSeq === -1) this._nextSeq = seq;
 
@@ -159,20 +145,6 @@ JitterBuffer.prototype._flush = function () {
     var entry = this._buffer[this._nextSeq & 0xFFFF];
 
     if (entry) {
-      // DIAG — log first 30 emits to see what order packets actually
-      // reach the depacketizer. Removed after diagnosis.
-      if (this._diagEmitCount === undefined) this._diagEmitCount = 0;
-      if (this._diagEmitCount < 30) {
-        this._diagEmitCount++;
-        var pl = entry.pkt.payload;
-        var firstByte = pl && pl.length ? pl[0] : 0;
-        var S = !!(firstByte & 0x10);
-        console.log('[jb emit #' + this._diagEmitCount + '] seq=' + (this._nextSeq & 0xFFFF) +
-                    ' marker=' + (entry.pkt.marker ? '1' : '0') +
-                    ' S=' + (S ? '1' : '0') +
-                    ' payloadLen=' + (pl ? pl.length : 0) +
-                    ' ts=' + entry.pkt.timestamp);
-      }
       // Packet available — emit it
       delete this._buffer[this._nextSeq & 0xFFFF];
       if (this._output) this._output(entry.pkt);
