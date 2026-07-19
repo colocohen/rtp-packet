@@ -35,6 +35,8 @@ import { DTMFPacketizer, DTMFDepacketizer } from './src/dtmf.js';
 
 import { JitterBuffer } from './src/jitter_buffer.js';
 import { SrtpSession, PROFILE_CM, PROFILE_GCM } from './src/srtp.js';
+import { REDPacketizer, REDDepacketizer } from './src/red.js';
+import { FlexFecEncoder, FlexFecDecoder } from './src/flexfec.js';
 import { SenderBuffer, RtxStream, NackThrottle, NackGenerator, Histogram, buildRtxPacket, parseRtxPacket } from './src/retransmit.js';
 import { parseTransportCC, parseREMB, BandwidthEstimator, TransportCCFeedbackGenerator } from './src/bandwidth.js';
 import { RtpHeaderStamper } from './src/rtp_header_stamper.js';
@@ -195,6 +197,8 @@ export {
 
   // ── SRTP ──
   SrtpSession,
+  REDPacketizer, REDDepacketizer,
+  FlexFecEncoder, FlexFecDecoder,
 
   // ── RTCP ──
   buildSR, buildRR, buildPLI, buildNACK, buildFIR, buildREMB, buildTransportCC,

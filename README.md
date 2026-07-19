@@ -21,6 +21,8 @@ Works anywhere RTP is spoken: WebRTC, RTSP, SIP, WHIP/WHEP, plain RTP-over-UDP.
   - [SRTP](#srtp)
   - [RTCP](#rtcp)
   - [Retransmission (NACK + RTX)](#retransmission-rfc-4585-nack--rfc-4588-rtx)
+  - [RED — redundant audio](#red--redundant-audio-rfc-2198)
+  - [FlexFEC — forward error correction](#flexfec--forward-error-correction-flexfec-03)
   - [Bandwidth estimation](#bandwidth-estimation)
   - [Header extension stamping](#header-extension-stamping)
   - [SDP](#sdp)
@@ -43,6 +45,8 @@ Works anywhere RTP is spoken: WebRTC, RTSP, SIP, WHIP/WHEP, plain RTP-over-UDP.
 - **SRTP** — AES-128-CM (RFC 3711) and AEAD AES-128-GCM (RFC 7714), replay protection, ROC rollover recovery, RFC 5764 DTLS keying-material helpers
 - **Jitter buffer** — reordering and loss detection with configurable latency, RTT-aware loss declaration, auto-resync on stream jumps, bounded memory
 - **NACK + RTX** — NACK generator with throttle, RTX cache and retransmission (RFC 4585 + 4588)
+- **RED** — redundant audio coding (RFC 2198): zero-RTT loss repair for Opus, Chrome-compatible
+- **FlexFEC** — forward error correction (flexfec-03, the variant libwebrtc ships): XOR repair packets for video
 - **Bandwidth estimation** — transport-cc and REMB feedback parsing + delay-based estimator
 - **SDP** — session description generator covering all supported codecs
 - **Pure JavaScript** — no native bindings, just two small pure-JS dependencies
@@ -485,6 +489,73 @@ if (nackGen.needKeyframe()) {                          // loss beyond RTX recove
 
 To know whether an arriving packet starts a keyframe without decoding it, every depacketizer exposes a static `peekKeyframe(payload)` — e.g. `VP8Depacketizer.peekKeyframe(pkt.payload)`.
 
+
+### RED — redundant audio (RFC 2198)
+
+Every packet carries the current frame plus copies of previous frame(s); a
+lost packet is repaired from the copy in the NEXT packet — zero round trips.
+This is Chrome's default audio hardening (`red/48000` wrapping Opus). ~2×
+audio bitrate (negligible for Opus) in exchange for immunity to single losses
+(`redundancy: 2` covers 2-packet bursts).
+
+```js
+import { REDPacketizer, REDDepacketizer, OpusDepacketizer } from 'rtp-packet';
+
+// Send: wrap encoded Opus frames (PTs come from SDP: red=63, opus=111)
+const red = new REDPacketizer({
+  ssrc, payloadType: 63, innerPayloadType: 111,
+  redundancy: 1,             // previous frames per packet (Chrome default)
+});
+const packets = red.packetize({ data: opusFrame, timestamp: tUs });
+
+// Receive: unwrap + auto-recover, chained into the inner depacketizer.
+// Emits parse()-shaped pseudo-packets (primary + recovered, deduped,
+// timestamp order) so the Opus depacketizer never knows RED existed:
+const opusD = new OpusDepacketizer({ output: (chunk) => decoder.decode(chunk) });
+const redD  = new REDDepacketizer({ output: (p) => opusD.depacketize(p) });
+redD.depacketize(parsedRtpPacket);
+```
+
+### FlexFEC — forward error correction (flexfec-03)
+
+XOR repair packets for video: one FEC packet per `groupSize` media packets;
+any single loss in the group is rebuilt from the FEC + survivors, no round
+trip. Overhead is `1/groupSize` (25% at 4) vs RED's 100% — which is why FEC
+is the video tool and RED the audio one. Implements **draft -03** (not RFC
+8627) deliberately: that's what libwebrtc/Chrome ship as
+`a=rtpmap:N flexfec-03/90000`. Flexible mask, single protected SSRC, mask
+sizes up to 109 packets; FEC rides on its own SSRC.
+
+```js
+import { FlexFecEncoder, FlexFecDecoder } from 'rtp-packet';
+
+// Send side — feed every outgoing media packet (pre-SRTP):
+const fec = new FlexFecEncoder({
+  ssrc: fecSsrc,             // the FEC stream's own SSRC (from SDP)
+  payloadType: 118,          // flexfec-03 PT (from SDP)
+  protectedSsrc: mediaSsrc,
+  groupSize: 4,              // tune with setGroupSize(n) from BWE loss stats
+});
+for (const pkt of mediaPackets) {
+  socket.send(srtp.protectRtp(pkt));
+  for (const f of fec.protect(pkt)) socket.send(srtp.protectRtp(f));
+}
+fec.flush();                 // optional: protect a partial group at burst end
+
+// Receive side — route by SSRC/PT, feed both streams:
+const dec = new FlexFecDecoder({
+  output: (recoveredRtpBuffer) => jitterBuffer.push(parse(recoveredRtpBuffer)),
+});
+dec.addMediaPacket(mediaRtpBuffer);   // every received media packet
+dec.addFecPacket(fecRtpBuffer);       // every received FEC packet
+// Recovered packets are byte-exact (header bits, marker, timestamp, payload).
+```
+
+**When each mechanism wins:** NACK/RTX is cheapest on low-RTT links with
+sporadic loss. RED/FEC win on high-RTT or bursty links because they never
+wait for a report. Mature stacks run all three: RED always-on for audio,
+NACK/RTX as the video default, FlexFEC enabled dynamically when loss climbs.
+
 ### Bandwidth estimation
 
 Parse incoming transport-cc feedback and feed it to a delay-based estimator.
@@ -633,6 +704,7 @@ This library is the protocol layer for any RTP-based system. Combine it with a t
 
 ## RFC compliance
 
+- RFC 2198 — RTP Payload for Redundant Audio Data (RED)
 - RFC 3550 — RTP: A Transport Protocol for Real-Time Applications
 - RFC 3551 — RTP Profile for Audio and Video Conferences (AVP)
 - RFC 3640 — RTP Payload Format for Transport of MPEG-4 Elementary Streams (AAC)
@@ -652,6 +724,7 @@ This library is the protocol layer for any RTP-based system. Combine it with a t
 - AOMedia AV1 RTP Specification — RTP Payload Format for AV1 (https://aomediacodec.github.io/av1-rtp-spec/)
 - draft-ietf-payload-vp9 — RTP Payload Format for VP9
 - draft-holmer-rmcat-transport-wide-cc — Transport-wide Congestion Control feedback
+- draft-ietf-payload-flexible-fec-scheme-03 — Flexible FEC (the variant libwebrtc ships; RFC 8627 changed the header and does not interop with Chrome)
 
 ## Comparison to other libraries
 
@@ -676,6 +749,8 @@ These run on plain Node without native bindings:
 | SRTP replay protection + ROC recovery | ✅ | partial | ❌ | ❌ |
 | JitterBuffer | ✅ | ✅ | ❌ | ❌ |
 | NACK + RTX (RFC 4585+4588) | ✅ | partial | ❌ | ❌ |
+| RED (RFC 2198) | ✅ | ⚪ header only | ❌ | ❌ |
+| FlexFEC (flexfec-03) | ✅ | ❌ | ❌ | ❌ |
 | Bandwidth estimation | ✅ | ❌ | ❌ | ❌ |
 | SDP generation | ✅ | ❌ | ❌ | ❌ |
 | Header extension stamping | ✅ | partial | ❌ | ❌ |
@@ -712,6 +787,11 @@ This keeps rtp-packet at ~5000 lines and minimal dependencies, while letting it 
 
 
 ## Changelog
+
+### 0.3.0
+
+- **RED (RFC 2198)**: `REDPacketizer` / `REDDepacketizer` — zero-RTT audio loss repair, Chrome-compatible wire format, configurable redundancy depth, recovered frames delivered in-order and deduped through a chainable depacketizer interface.
+- **FlexFEC (flexfec-03)**: `FlexFecEncoder` / `FlexFecDecoder` — XOR repair packets with flexible masks up to 109 packets (all three mask-chunk sizes), byte-exact recovery verified for every position in a group, sequence-wrap safe, `flush()` for partial groups, runtime `setGroupSize()` for BWE-driven adaptation. Implements the draft -03 wire format that libwebrtc actually ships, not RFC 8627.
 
 ### 0.2.0
 
