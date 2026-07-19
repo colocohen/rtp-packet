@@ -31,7 +31,7 @@ import { G711Packetizer, G711Depacketizer } from './src/g711.js';
 import { G722Packetizer, G722Depacketizer } from './src/g722.js';
 import { H265Packetizer, H265Depacketizer } from './src/h265.js';
 import { AacPacketizer, AacDepacketizer } from './src/aac.js';
-import { DTMFPacketizer, DTMFDepacketizer } from './src/dtmf.js';
+import { DTMFPacketizer, DTMFDepacketizer, DtmfPacketizer, parseDtmf } from './src/dtmf.js';
 
 import { JitterBuffer } from './src/jitter_buffer.js';
 import { SrtpSession, PROFILE_CM, PROFILE_GCM, PROFILE_GCM_256 } from './src/srtp.js';
@@ -182,7 +182,6 @@ export {
   G711Packetizer, G711Depacketizer,
   G722Packetizer, G722Depacketizer,
   AacPacketizer, AacDepacketizer,
-  DTMFPacketizer, DTMFDepacketizer,
 
   // ── Codec factory helpers (codec name → instance) ──
   // Use these when the codec is config-driven (RTSP DESCRIBE, WebRTC
@@ -226,6 +225,7 @@ export {
 
   // ── SRTP profile name constants ──
   PROFILE_CM, PROFILE_GCM, PROFILE_GCM_256,
+  DtmfPacketizer, DTMFPacketizer, DTMFDepacketizer, parseDtmf,
 };
 
 export default {
@@ -240,7 +240,6 @@ export default {
   G711Packetizer, G711Depacketizer,
   G722Packetizer, G722Depacketizer,
   AacPacketizer, AacDepacketizer,
-  DTMFPacketizer, DTMFDepacketizer,
   createPacketizer, createDepacketizer,
   PACKETIZERS, DEPACKETIZERS,
   JitterBuffer, SrtpSession,
@@ -254,4 +253,5 @@ export default {
   parseExtensions, writeExtensions, setHeaderExtension, setHeaderExtensions,
   absSendTime, transportCC, audioLevel, readAbsSendTime, readAudioLevel,
   PROFILE_CM, PROFILE_GCM, PROFILE_GCM_256,
+  DtmfPacketizer, DTMFPacketizer, DTMFDepacketizer, parseDtmf,
 };

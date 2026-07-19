@@ -1,266 +1,178 @@
 /**
- * dtmf — DTMF and named telephony events over RTP (RFC 4733).
+ * dtmf.js — RFC 4733 telephone-event RTP payload (DTMF).
  *
- *   chunk { event, durationSamples, timestamp, end }
- *      → DTMFPacketizer  → Buffer[]
- *   RTP packet
- *      → DTMFDepacketizer → chunk via output()
+ * Wire format (§2.3), 4 bytes per event packet:
  *
- * What this is for
- * ----------------
- * DTMF (Dual-Tone Multi-Frequency) is "press 1 for English". In a SIP
- * call you can't just play the tone in-band over the audio codec —
- * Opus/G.711 don't preserve the precise frequencies, and tones can get
- * corrupted by codec compression or Voice Activity Detection. RFC 4733
- * solves this by carrying the DTMF event itself out-of-band as a
- * dedicated RTP payload type.
+ *    0                   1                   2                   3
+ *    0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
+ *   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+ *   |     event     |E|R| volume    |          duration             |
+ *   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
  *
- * The wire format is tiny — 4 bytes per packet:
+ * Event semantics (§2.5.1.2):
+ *   - RTP timestamp is FIXED for the whole event (= start instant);
+ *     the growing `duration` field carries elapsed time instead.
+ *   - marker=1 on the FIRST packet of an event only.
+ *   - The final packet sets E=1 and is retransmitted twice (3 total end
+ *     packets) for loss robustness — receivers dedupe by timestamp.
  *
- *   0                   1                   2                   3
- *   0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
- *  +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
- *  |     event     |E|R| volume    |          duration             |
- *  +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
- *
- *   event     — 0..15 = "0".."9", "*", "#", "A".."D"; 16+ = other named events
- *   E         — End-of-event flag (set on the LAST packets of an event)
- *   R         — Reserved, MUST be 0
- *   volume    — 0..63 (negative dBm0; 0 is loudest, RFC 4733 §2.3.4)
- *   duration  — total event duration so far, in RTP timestamp units
- *
- * State machine (caller's responsibility — this module is RTP only)
- * -----------------------------------------------------------------
- * A single DTMF press of "5" looks roughly like this on the wire:
- *
- *   seq=N+0,  ts=T,  marker=1, event=5, duration= 160, end=0    (start)
- *   seq=N+1,  ts=T,            event=5, duration= 320, end=0
- *   seq=N+2,  ts=T,            event=5, duration= 480, end=0    (every 50 ms)
- *   seq=N+3,  ts=T,            event=5, duration= 640, end=1    (final, 3×)
- *   seq=N+4,  ts=T,            event=5, duration= 640, end=1
- *   seq=N+5,  ts=T,            event=5, duration= 640, end=1
- *
- * Notes:
- *   - All packets share the same RTP timestamp T (the start of the event).
- *   - Sequence numbers advance normally.
- *   - Duration grows by the packetization interval (typically 50 ms).
- *   - The marker bit on the FIRST packet signals "start of new event"
- *     (RFC 4733 §2.5.1.2).
- *   - The final packet (E=1) is sent THREE times for redundancy — losing
- *     the end-of-event packet is much more harmful than losing a mid
- *     packet. The caller drives this; the packetizer doesn't decide.
- *
- * The packetizer is intentionally low-level: it builds one RTP packet
- * per call, given the event/duration/end fields. A higher-level
- * "sendDigit('5', 200ms)" helper belongs in a SIP softphone library
- * built on top of rtp-packet, not in rtp-packet itself.
+ * Division of labor: this class owns byte layout + per-event RTP field
+ * discipline (ts/marker/E/duration). The CALLER owns real-time pacing
+ * and the tone queue (webrtc-server's RTCDTMFSender), and — critically —
+ * the sequence-number space: DTMF rides the SAME SSRC as the audio
+ * stream, so seq numbers must come from the audio packetizer's counter.
+ * Pass a `nextSequenceNumber` callback for that; standalone use can
+ * omit it and get an internal counter.
  */
 
-import {
-  initPacketizer, makePacket, usToRtp,
-  initDepacketizer, emitError,
-} from './rtp.js';
+import { serialize } from './rtp.js';
 
-// RTP payload type clock rate. Per RFC 4733 §2.1, the named-event
-// payload format inherits the sample rate of the audio stream it's
-// multiplexed with. Telephony audio (G.711, G.722, AMR) is 8 kHz, and
-// telephone-event/8000 is what every SIP softphone advertises. We
-// default to 8000 but allow override for 48 kHz Opus deployments
-// (telephone-event/48000 is also legal — Chrome/Firefox use it).
-var DEFAULT_CLOCK_RATE = 8000;
-
-// Event name → numeric code (RFC 4733 §3.2 + §3.3).
-// The packetizer accepts either the numeric code or these strings.
-var EVENT_NAMES = {
-  '0': 0,  '1': 1,  '2': 2,  '3': 3,  '4': 4,
-  '5': 5,  '6': 6,  '7': 7,  '8': 8,  '9': 9,
-  '*': 10, '#': 11,
-  'A': 12, 'B': 13, 'C': 14, 'D': 15,
+var EVENT_CODES = {
+  '0': 0, '1': 1, '2': 2, '3': 3, '4': 4, '5': 5, '6': 6, '7': 7,
+  '8': 8, '9': 9, '*': 10, '#': 11, 'A': 12, 'B': 13, 'C': 14, 'D': 15,
 };
 
+function DtmfPacketizer(opts) {
+  if (!(this instanceof DtmfPacketizer)) return new DtmfPacketizer(opts);
+  if (!opts || opts.ssrc == null || opts.payloadType == null) {
+    throw new Error('DtmfPacketizer: ssrc and payloadType are required');
+  }
+  this.ssrc = opts.ssrc >>> 0;
+  this.payloadType = opts.payloadType & 0x7F;
+  this.clockRate = opts.clockRate || 48000;   // matches the paired audio codec
+  this._nextSeq = (typeof opts.nextSequenceNumber === 'function')
+    ? opts.nextSequenceNumber
+    : null;
+  this._seq = (opts.initialSequenceNumber != null)
+    ? (opts.initialSequenceNumber & 0xFFFF)
+    : (Math.random() * 0x10000) & 0xFFFF;
 
-// ═══════════════════════════════════════════════════════════════════
-//  Packetizer
-// ═══════════════════════════════════════════════════════════════════
+  // Active-event state
+  this._eventCode = null;
+  this._eventTs = 0;          // fixed RTP ts for the event
+  this._elapsedTicks = 0;
+  this._first = false;
+}
+
+DtmfPacketizer.codeForTone = function (ch) {
+  var c = EVENT_CODES[String(ch).toUpperCase()];
+  return (c === undefined) ? null : c;
+};
+
+DtmfPacketizer.prototype._takeSeq = function () {
+  if (this._nextSeq) return this._nextSeq() & 0xFFFF;
+  var s = this._seq;
+  this._seq = (this._seq + 1) & 0xFFFF;
+  return s;
+};
 
 /**
- * DTMFPacketizer — builds a single named-event RTP packet (RFC 4733).
- *
- * Stateless beyond the inherited sequence counter — does NOT manage
- * the event state machine (start / mid / end / 3× redundancy). That
- * belongs to the caller.
- *
- * @param {object}  opts
- * @param {number}  opts.ssrc                     required, 32-bit
- * @param {number}  opts.payloadType              required, 0-127
- *                                                 (dynamic; whatever was
- *                                                  negotiated for telephone-event)
- * @param {number} [opts.clockRate]               default 8000
- *                                                 (matches telephone-event/8000)
- * @param {number} [opts.mtu]                     default 1400 (irrelevant — DTMF is 4 bytes)
- * @param {number} [opts.initialSequenceNumber]   default random
+ * Begin a new event. `timestamp` is the RTP timestamp of the start
+ * instant (caller derives it from the audio clock).
  */
-function DTMFPacketizer(opts) {
-  initPacketizer(this, opts);
-  this.clockRate = (opts && typeof opts.clockRate === 'number')
-    ? opts.clockRate : DEFAULT_CLOCK_RATE;
+DtmfPacketizer.prototype.startEvent = function (toneChar, timestamp) {
+  var code = DtmfPacketizer.codeForTone(toneChar);
+  if (code === null) throw new Error('DtmfPacketizer: invalid tone "' + toneChar + '"');
+  this._eventCode = code;
+  this._eventTs = timestamp >>> 0;
+  this._elapsedTicks = 0;
+  this._first = true;
+};
+
+DtmfPacketizer.prototype._buildPayload = function (end, volume) {
+  var p = Buffer.allocUnsafe(4);
+  p[0] = this._eventCode & 0xFF;
+  p[1] = (end ? 0x80 : 0x00) | (volume & 0x3F);   // E | R=0 | volume (dBm0, 0..63)
+  p.writeUInt16BE(Math.min(this._elapsedTicks, 0xFFFF), 2);
+  return p;
+};
+
+/**
+ * Emit one update packet, advancing elapsed time by deltaMs.
+ * Returns a single serialized RTP packet (Buffer).
+ */
+DtmfPacketizer.prototype.update = function (deltaMs, opts) {
+  if (this._eventCode === null) throw new Error('DtmfPacketizer: no active event');
+  this._elapsedTicks += Math.round(deltaMs * this.clockRate / 1000);
+  var pkt = serialize({
+    payloadType: this.payloadType,
+    sequenceNumber: this._takeSeq(),
+    timestamp: this._eventTs,
+    ssrc: this.ssrc,
+    marker: this._first,
+    payload: this._buildPayload(false, (opts && opts.volume) != null ? opts.volume : 10),
+  });
+  this._first = false;
+  return pkt;
+};
+
+/**
+ * Finish the event: emits the E=1 packet plus 2 retransmits (§2.5.1.2
+ * — 3 identical end packets except for their sequence numbers).
+ * Returns an array of 3 serialized RTP packets and clears event state.
+ */
+DtmfPacketizer.prototype.endEvent = function (finalDeltaMs, opts) {
+  if (this._eventCode === null) throw new Error('DtmfPacketizer: no active event');
+  if (finalDeltaMs) this._elapsedTicks += Math.round(finalDeltaMs * this.clockRate / 1000);
+  var out = [];
+  var payload = this._buildPayload(true, (opts && opts.volume) != null ? opts.volume : 10);
+  for (var i = 0; i < 3; i++) {
+    out.push(serialize({
+      payloadType: this.payloadType,
+      sequenceNumber: this._takeSeq(),
+      timestamp: this._eventTs,
+      ssrc: this.ssrc,
+      marker: this._first,     // only true if the event had zero updates
+      payload: payload,
+    }));
+    this._first = false;
+  }
+  this._eventCode = null;
+  return out;
+};
+
+/**
+ * parseDtmf — inverse: read a telephone-event payload.
+ * @returns {{event, end, volume, duration, tone}|null}
+ */
+function parseDtmf(payload) {
+  if (!payload || payload.length < 4) return null;
+  var event = payload[0];
+  if (event > 15) return null;   // tones only (events 16+ are other signals)
+  var TONES = '0123456789*#ABCD';
+  return {
+    event: event,
+    tone: TONES[event],
+    end: !!(payload[1] & 0x80),
+    volume: payload[1] & 0x3F,
+    duration: payload.readUInt16BE(2),
+  };
 }
 
 /**
- * Build one RTP packet carrying a DTMF named-event payload.
- *
- * @param {object} chunk
- * @param {number|string} chunk.event       0-15 numeric, or '0'-'9', '*', '#', 'A'-'D'
- * @param {number} chunk.timestamp          microseconds — start time of the event
- *                                          (SAME for every packet of one event)
- * @param {number} chunk.durationSamples    cumulative duration so far, in RTP clock ticks
- * @param {boolean} [chunk.end]             true on the final 3 packets of the event
- * @param {boolean} [chunk.marker]          true on the FIRST packet of a new event
- *                                          (RFC 4733 §2.5.1.2). Default false.
- * @param {number} [chunk.volume]           0-63 (negative dBm0). Default 10.
- * @returns {Buffer[]} array with one RTP packet
- */
-DTMFPacketizer.prototype.packetize = function (chunk) {
-  return [_packetize(this, chunk, false)];
-};
-
-/** @returns {Array<{buffer, sequenceNumber, timestamp, marker}>} */
-DTMFPacketizer.prototype.packetizeWithMeta = function (chunk) {
-  return [_packetize(this, chunk, true)];
-};
-
-DTMFPacketizer.prototype.close = function () {};
-
-
-function _packetize(self, chunk, withMeta) {
-  if (!chunk || typeof chunk !== 'object') {
-    throw new TypeError('DTMFPacketizer.packetize: chunk object is required');
-  }
-  if (typeof chunk.timestamp !== 'number' || !Number.isFinite(chunk.timestamp)) {
-    throw new TypeError('DTMFPacketizer.packetize: chunk.timestamp must be a finite number (microseconds)');
-  }
-  if (typeof chunk.durationSamples !== 'number' || chunk.durationSamples < 0 || chunk.durationSamples > 0xFFFF) {
-    throw new TypeError('DTMFPacketizer.packetize: chunk.durationSamples must be 0..65535 (RTP clock ticks)');
-  }
-
-  // Resolve event: accept numeric (0..255 per §2.3.2; we stay 0..15 for
-  // DTMF but allow up to 255 for non-DTMF named events e.g. fax tones)
-  // or symbolic ('5', '*', 'A').
-  var ev;
-  if (typeof chunk.event === 'number') {
-    if (!Number.isInteger(chunk.event) || chunk.event < 0 || chunk.event > 255) {
-      throw new RangeError('DTMFPacketizer.packetize: chunk.event must be 0..255');
-    }
-    ev = chunk.event;
-  } else if (typeof chunk.event === 'string') {
-    var key = chunk.event.toUpperCase();
-    if (!(key in EVENT_NAMES)) {
-      throw new RangeError("DTMFPacketizer.packetize: unknown event name '" + chunk.event + "'");
-    }
-    ev = EVENT_NAMES[key];
-  } else {
-    throw new TypeError('DTMFPacketizer.packetize: chunk.event must be a number or DTMF symbol string');
-  }
-
-  var volume = (chunk.volume == null) ? 10 : (chunk.volume & 0x3F);
-  var endBit = chunk.end ? 0x80 : 0x00;
-
-  // 4-byte RFC 4733 payload — built directly, no intermediate Buffer.
-  var payload = Buffer.allocUnsafe(4);
-  payload[0] = ev & 0xFF;
-  payload[1] = endBit | (volume & 0x3F);   // R bit (0x40) MUST be 0
-  payload[2] = (chunk.durationSamples >>> 8) & 0xFF;
-  payload[3] = chunk.durationSamples & 0xFF;
-
-  var rtpTs = usToRtp(chunk.timestamp, self.clockRate);
-  var marker = !!chunk.marker;
-  return makePacket(self, payload, rtpTs, marker, withMeta);
-}
-
-
-// ═══════════════════════════════════════════════════════════════════
-//  Depacketizer
-// ═══════════════════════════════════════════════════════════════════
-
-/**
- * DTMFDepacketizer — parses a named-event RTP packet (RFC 4733) and
- * surfaces the event fields to the caller.
- *
- * Like the packetizer, this is stateless — it does NOT collapse the
- * 3× end-of-event redundancy or detect mid-press losses. Callers that
- * want a "press completed" event should consume the chunks here and
- * apply de-duplication on (event, ssrc, RTP timestamp) themselves;
- * that policy belongs in a SIP layer above.
- *
- * @param {object}   opts
- * @param {function} opts.output  called with chunk (see below)
- * @param {function} [opts.error] called with Error on malformed input
- *
- * Output chunk shape:
- *   {
- *     event:           number,          // 0..255
- *     end:             boolean,
- *     volume:          number,          // 0..63
- *     durationSamples: number,          // 0..65535
- *     timestamp:       number,          // RTP timestamp from packet (ticks, not µs)
- *     marker:          boolean,
- *     // Convenience: event name when applicable, else null
- *     symbol:          string|null,     // '5', '*', 'A', etc.
- *   }
+ * DTMFDepacketizer — library-convention counterpart ({output} callback,
+ * depacketize(parsedPacket)). Emits one event per E=1 packet (deduped
+ * by event timestamp, since the end packet is sent 3x).
  */
 function DTMFDepacketizer(opts) {
-  initDepacketizer(this, opts);
+  if (!(this instanceof DTMFDepacketizer)) return new DTMFDepacketizer(opts);
+  this._output = (opts && opts.output) || function () {};
+  this._lastEndTs = null;
 }
-
-/**
- * peekKeyframe — DTMF carries no media frames; there is no keyframe
- * concept. Returns false to match the uniform NackGenerator interface.
- */
-DTMFDepacketizer.peekKeyframe = function () { return false; };
-
-/**
- * Reverse lookup table — built once at module load. EVENT_NAMES is small
- * enough that an inverse table is the cleanest implementation.
- */
-var _EVENT_SYMBOLS = (function () {
-  var t = new Array(16);
-  for (var name in EVENT_NAMES) {
-    t[EVENT_NAMES[name]] = name;
+DTMFDepacketizer.prototype.depacketize = function (pkt) {
+  var payload = pkt.payload || pkt;
+  var ev = parseDtmf(payload);
+  if (!ev) return;
+  if (ev.end) {
+    var ts = pkt.timestamp >>> 0;
+    if (this._lastEndTs === ts) return;      // end-packet retransmit
+    this._lastEndTs = ts;
+    this._output({ tone: ev.tone, event: ev.event, volume: ev.volume,
+                   duration: ev.duration, timestamp: ts });
   }
-  return t;
-})();
-
-DTMFDepacketizer.prototype.depacketize = function (packet) {
-  if (!packet || !packet.payload || packet.payload.length < 4) {
-    emitError(this, new Error('DTMFDepacketizer: payload must be at least 4 bytes'));
-    return;
-  }
-
-  var p = packet.payload;
-  var event = p[0];
-  var b1 = p[1];
-  var endBit = !!(b1 & 0x80);
-  // Bit 6 (0x40) is reserved per RFC 4733 §2.3.1; we ignore it on input.
-  var volume = b1 & 0x3F;
-  var durationSamples = (p[2] << 8) | p[3];
-
-  this._output({
-    event: event,
-    end: endBit,
-    volume: volume,
-    durationSamples: durationSamples,
-    timestamp: packet.timestamp,
-    marker: !!packet.marker,
-    symbol: (event < 16) ? (_EVENT_SYMBOLS[event] || null) : null,
-  });
 };
 
-DTMFDepacketizer.prototype.reset = function () {};
+// Registry-facing aliases (index.js maps 'dtmf'/'telephone-event' to these)
+var DTMFPacketizer = DtmfPacketizer;
 
-DTMFDepacketizer.prototype.close = function () {
-  this._output = null;
-  this._error = null;
-};
-
-
-export { DTMFPacketizer, DTMFDepacketizer };
+export { DtmfPacketizer, DTMFPacketizer, DTMFDepacketizer, parseDtmf };

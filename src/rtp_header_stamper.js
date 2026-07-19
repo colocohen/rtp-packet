@@ -71,7 +71,7 @@
 // transport-cc extension is stamped.
 //
 
-import { setHeaderExtensions, transportCC, absSendTime } from './rtp.js';
+import { setHeaderExtensions, transportCC, absSendTime, audioLevel } from './rtp.js';
 
 
 /**
@@ -122,7 +122,7 @@ function RtpHeaderStamper(opts) {
  *
  * If the extMap has no known keys, the packet is returned unchanged.
  */
-RtpHeaderStamper.prototype.stamp = function (rtpPacket) {
+RtpHeaderStamper.prototype.stamp = function (rtpPacket, hints) {
   // Collect all extensions into one map, then apply them in a SINGLE
   // setHeaderExtensions() pass — one parse of the existing block and
   // one output allocation, instead of one per extension. For a WebRTC
@@ -136,6 +136,17 @@ RtpHeaderStamper.prototype.stamp = function (rtpPacket) {
   // Transport-wide congestion control sequence number. Increment
   // *first*, so the counter starts at 1, not 0 (matching Chrome's
   // observed behavior — their first-seen seq is 1).
+  // ssrc-audio-level (RFC 6464) — per-PACKET data, unlike the
+  // stamper-internal counters: the level depends on the audio frame
+  // inside this very packet, so the caller supplies it via `hints`
+  // ({ audioLevel: 0..127 dBov, voiceActivity: bool }). No hint → no
+  // extension emitted (spec-legal; receivers treat it as absent).
+  var alId = this._extMap['audio-level'];
+  if (alId != null && hints && hints.audioLevel != null) {
+    batch[alId] = audioLevel(hints.audioLevel & 0x7F, !!hints.voiceActivity);
+    any = true;
+  }
+
   var twccId = this._extMap['transport-cc'];
   if (twccId != null) {
     this._twccSeq = (this._twccSeq + 1) & 0xFFFF;
