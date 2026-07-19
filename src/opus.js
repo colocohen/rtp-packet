@@ -49,10 +49,18 @@ function OpusPacketizer(opts) {
   this._lastRtpTs = 0;
 }
 
-// 500 ms in 48 kHz RTP units. Long enough that normal jitter (typically
-// <100 ms) never crosses it; short enough that a real pause is detected
-// promptly. Outside this window we consider the talkspurt continuous.
-var _SILENCE_GAP_RTP = 24000;
+// 500 ms in 48 kHz RTP units (0.5 × CLOCK_RATE). Long enough that
+// normal jitter (typically <100 ms) never crosses it; short enough that
+// a real pause is detected promptly. Outside this window we consider
+// the talkspurt continuous.
+//
+// ⚠ CODEC-SPECIFIC CONSTANT: the value is in RTP TICKS, so it is only
+// "500 ms" because Opus always uses a 48 kHz RTP clock (RFC 7587 §4.1).
+// If you copy this talkspurt-detection pattern to another codec, derive
+// the threshold from THAT codec's clock rate (0.5 * CLOCK_RATE) — a
+// hardcoded 24000 means 3 s at 8 kHz G.711 and would silently break
+// marker-bit semantics.
+var _SILENCE_GAP_RTP = CLOCK_RATE / 2;   // = 24000 @ 48 kHz
 
 /**
  * @param {object} chunk

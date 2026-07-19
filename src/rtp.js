@@ -396,9 +396,21 @@ function validateChunk(self, chunk) {
 
 /**
  * Convert microseconds to a codec's RTP clock ticks.
+ *
+ * Split into whole seconds + remainder before multiplying: the naive
+ * `us * clockRate` exceeds Number.MAX_SAFE_INTEGER (2^53) once `us`
+ * passes ~10^11 at a 90 kHz clock — about 29 hours of stream time, or
+ * immediately if the caller passes epoch-microseconds. The split keeps
+ * every intermediate below 2^53 for any realistic input, and the final
+ * >>> 0 applies the RTP 32-bit wraparound.
  */
 function usToRtp(us, clockRate) {
-  return ((us * clockRate / 1000000) >>> 0);
+  var sec = Math.floor(us / 1000000);
+  var rem = us - sec * 1000000;
+  // (sec * clockRate) mod 2^32 — sec*clockRate stays < 2^53 for any
+  // epoch-scale input (1.7e9 s × 9e4 ≈ 1.5e14).
+  var ticks = (sec % 4294967296) * clockRate + rem * clockRate / 1000000;
+  return (ticks % 4294967296) >>> 0;
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -630,11 +642,71 @@ function setHeaderExtension(rtpPacket, id, data) {
   return out;
 }
 
+/**
+ * Set (add or replace) MULTIPLE one-byte header extensions in a single
+ * pass. Functionally equivalent to chaining setHeaderExtension() once
+ * per id, but does ONE parse of the existing block and ONE output
+ * allocation instead of N — this is the hot path for WebRTC senders
+ * that stamp transport-cc + abs-send-time + mid on every packet.
+ *
+ * @param {Buffer} rtpPacket — existing serialized RTP packet
+ * @param {object} extsMap   — { id: Buffer } map; ids 1-14, data 1-16 bytes.
+ *                             Invalid entries are skipped (same per-entry
+ *                             semantics as setHeaderExtension).
+ * @returns {Buffer} new packet with the extensions applied
+ */
+function setHeaderExtensions(rtpPacket, extsMap) {
+  rtpPacket = _toBuffer(rtpPacket);
+  if (!rtpPacket || rtpPacket.length < RTP_HEADER_SIZE) return rtpPacket;
+  if (!extsMap || typeof extsMap !== 'object') return rtpPacket;
+
+  var cc = rtpPacket[0] & 0x0F;
+  var hasExt = !!(rtpPacket[0] & 0x10);
+  var fixedHeaderEnd = RTP_HEADER_SIZE + cc * 4;    // end of CSRC list
+
+  var existingExts = {};
+  var extBlockLen = 0;
+
+  if (hasExt) {
+    if (rtpPacket.length < fixedHeaderEnd + 4) return rtpPacket;
+    var extProfile = rtpPacket.readUInt16BE(fixedHeaderEnd);
+    if (extProfile !== PROFILE_ONE_BYTE) return rtpPacket;   // two-byte form: skip
+    var extDataWords = rtpPacket.readUInt16BE(fixedHeaderEnd + 2);
+    extBlockLen = 4 + extDataWords * 4;
+    if (rtpPacket.length < fixedHeaderEnd + extBlockLen) return rtpPacket;
+    existingExts = parseExtensions(
+      rtpPacket.subarray(fixedHeaderEnd + 4, fixedHeaderEnd + extBlockLen)
+    );
+  }
+
+  var added = 0;
+  for (var key in extsMap) {
+    var id = +key;
+    var data = _toBuffer(extsMap[key]);
+    if (id < 1 || id > 14) continue;
+    if (!data || data.length < 1 || data.length > 16) continue;
+    existingExts[id] = data;
+    added++;
+  }
+  if (added === 0 && !hasExt) return rtpPacket;
+
+  var newExtBlock = writeExtensions(existingExts);
+  var payload = rtpPacket.subarray(fixedHeaderEnd + extBlockLen);
+
+  var out = Buffer.allocUnsafe(fixedHeaderEnd + newExtBlock.length + payload.length);
+  rtpPacket.copy(out, 0, 0, fixedHeaderEnd);
+  out[0] = out[0] | 0x10;                       // force X=1
+  newExtBlock.copy(out, fixedHeaderEnd);
+  payload.copy(out, fixedHeaderEnd + newExtBlock.length);
+  return out;
+}
+
 export {
   serialize, parse, RTP_HEADER_SIZE, RTP_VERSION, DEFAULT_MTU,
   initPacketizer, makePacket, makePacketWithPrefix, validateChunk, usToRtp,
   initDepacketizer, emitError,
-  parseExtensions, writeExtensions, setHeaderExtension, PROFILE_ONE_BYTE,
+  parseExtensions, writeExtensions, setHeaderExtension, setHeaderExtensions,
+  PROFILE_ONE_BYTE,
   absSendTime, transportCC, audioLevel, readAbsSendTime, readAudioLevel,
   _toBuffer,
 };

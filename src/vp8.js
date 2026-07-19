@@ -24,9 +24,29 @@ var CLOCK_RATE = 90000;
  * @param {number}  opts.payloadType              required, 0-127
  * @param {number} [opts.mtu]                     default 1400
  * @param {number} [opts.initialSequenceNumber]   default random
+ * @param {boolean|number} [opts.pictureId]       emit a 15-bit PictureID in the
+ *                          payload descriptor (RFC 7741 §4.2). Pass `true` for
+ *                          a random initial value or a number for a specific
+ *                          one. The PictureID increments once per FRAME (all
+ *                          fragments of a frame share it) and wraps at 2^15.
+ *
+ *                          Off by default for wire-compat with the minimal
+ *                          descriptor. Turn it ON for WebRTC/SFU use: without
+ *                          a PictureID, receivers can't do frame-level
+ *                          continuity tracking and simulcast layer switching
+ *                          (libwebrtc's packet buffer keys frames on it).
  */
 function VP8Packetizer(opts) {
   initPacketizer(this, opts);
+  if (opts && opts.pictureId !== undefined && opts.pictureId !== false) {
+    this._hasPid = true;
+    this._pid = (typeof opts.pictureId === 'number')
+      ? (opts.pictureId & 0x7FFF)
+      : Math.floor(Math.random() * 0x8000);
+  } else {
+    this._hasPid = false;
+    this._pid = 0;
+  }
 }
 
 /**
@@ -67,12 +87,32 @@ VP8Packetizer.prototype.close = function () {};
 function _packetize(self, chunk, withMeta) {
   var data = _toBuffer(chunk.data);
   var rtpTs = usToRtp(chunk.timestamp, CLOCK_RATE);
-  var maxPayload = self.mtu - 1;   // -1 for the 1-byte VP8 descriptor
+
+  // Descriptor layout (RFC 7741 §4.2):
+  //   minimal: [X=0|...|S|PID=0]                              → 1 byte
+  //   with PictureID: [X=1|...|S|0] [I=1|...] [M=1|pid15 hi] [pid lo] → 4 bytes
+  var hasPid = self._hasPid;
+  var prefixLen = hasPid ? 4 : 1;
+  var maxPayload = self.mtu - prefixLen;
+
+  // PictureID increments once per FRAME; every fragment of this frame
+  // carries the same value (RFC 7741: "incremented by 1 for each
+  // subsequent frame").
+  var pidHi = 0, pidLo = 0;
+  if (hasPid) {
+    var pid = self._pid;
+    self._pid = (pid + 1) & 0x7FFF;
+    pidHi = 0x80 | ((pid >> 8) & 0x7F);   // M=1 → 15-bit PictureID
+    pidLo = pid & 0xFF;
+  }
+  var descFirst = hasPid ? 0x90 : 0x10;   // X (0x80 when extended) + S
+  var descCont  = hasPid ? 0x80 : 0x00;   // X only on continuation
+  var extByte   = 0x80;                   // I=1 (PictureID present)
 
   // Fast path — single-packet (no fragmentation). Marker = true (frame end).
   if (data.length <= maxPayload) {
     return [makePacketWithPrefix(
-      self, 0x10, 0, 0, 0, 1,        // VP8 descriptor: S=1 (start of partition)
+      self, descFirst, extByte, pidHi, pidLo, prefixLen,
       data, 0, data.length,
       rtpTs, true, withMeta
     )];
@@ -87,7 +127,7 @@ function _packetize(self, chunk, withMeta) {
     var isLast = (i === fragCount - 1);
     var size = Math.min(maxPayload, data.length - offset);
     out.push(makePacketWithPrefix(
-      self, isFirst ? 0x10 : 0x00, 0, 0, 0, 1,   // S bit only on first
+      self, isFirst ? descFirst : descCont, extByte, pidHi, pidLo, prefixLen,
       data, offset, size,
       rtpTs, isLast, withMeta
     ));
@@ -196,7 +236,11 @@ VP8Depacketizer.prototype.depacketize = function (packet) {
     if (ext & 0x40) hdrLen++;  // TL0PICIDX
     // TID/Y/KEYIDX share one byte; present if T (0x20) OR K (0x10) is set.
     if (ext & 0x30) hdrLen++;  // TID/Y/KEYIDX
-    if ((ext & 0x80) && hdrLen <= payload.length && (payload[2] & 0x80)) hdrLen++;
+    // 16-bit PictureID: the first PID byte sits at index 2 (right after
+    // the extension byte); its top bit (M) signals a second PID byte.
+    // Previous check compared hdrLen against payload.length, which is
+    // unrelated to whether index 2 is readable.
+    if ((ext & 0x80) && payload.length > 2 && (payload[2] & 0x80)) hdrLen++;
   }
   if (hdrLen >= payload.length) {
     emitError(this, new Error('VP8Depacketizer: header larger than payload'));

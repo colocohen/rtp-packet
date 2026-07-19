@@ -168,9 +168,12 @@ function _packetize(self, chunk, withMeta) {
         'RtpPacketWarning'
       );
     }
-    // We still produce the packets, but the size field will be
-    // truncated to 13 bits. This will fail to decode; that's the
-    // caller's problem, but at least the bytes go on the wire.
+    // Drop the AU rather than emitting a wire-corrupt packet: a
+    // truncated 13-bit size field is guaranteed to fail decoding on
+    // the receiver AND desync its AU-header/data accounting, which can
+    // poison subsequent packets too. One dropped (impossible) frame is
+    // strictly better than a poisoned stream.
+    return [];
   }
 
   var rtpTs = usToRtp(chunk.timestamp, self.clockRate);

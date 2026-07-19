@@ -365,10 +365,59 @@ H264Depacketizer.prototype.close = function () {
 // ═══════════════════════════════════════════════════════════════════
 
 /**
+ * Split an encoded H.264 buffer into NALUs, auto-detecting the framing:
+ *
+ *   Annex-B — NALUs separated by start codes (00 00 01 / 00 00 00 01).
+ *             What ffmpeg's raw h264 output and most encoders emit.
+ *   AVCC    — NALUs prefixed by 4-byte big-endian lengths. What MP4
+ *             containers and WebCodecs (avc format) hand out.
+ *
+ * Detection: a leading start code means Annex-B. Otherwise we attempt a
+ * strict AVCC walk — 4-byte lengths that exactly tile the buffer, each
+ * NALU non-empty with a plausible NAL header. If the walk fails, we
+ * fall back to the Annex-B splitter (which degrades to "whole buffer is
+ * one NALU" for unframed input, preserving the old behavior).
+ */
+function _splitNALUs(buf) {
+  if (_startsWithStartCode(buf)) return _splitAnnexB(buf);
+  var avcc = _trydSplitAVCC(buf);
+  if (avcc) return avcc;
+  return _splitAnnexB(buf);
+}
+
+function _startsWithStartCode(buf) {
+  if (buf.length >= 3 && buf[0] === 0 && buf[1] === 0 && buf[2] === 1) return true;
+  if (buf.length >= 4 && buf[0] === 0 && buf[1] === 0 && buf[2] === 0 && buf[3] === 1) return true;
+  return false;
+}
+
+/**
+ * Strict AVCC parse: 4-byte BE length prefixes that exactly tile the
+ * buffer. Returns the NALU array, or null if the buffer isn't valid
+ * AVCC (so the caller can fall back to Annex-B).
+ */
+function _trydSplitAVCC(buf) {
+  if (buf.length < 5) return null;
+  var nalus = [];
+  var off = 0;
+  while (off < buf.length) {
+    if (off + 4 > buf.length) return null;
+    var len = buf.readUInt32BE(off);
+    off += 4;
+    if (len === 0 || off + len > buf.length) return null;
+    // Sanity: forbidden_zero_bit must be 0 in a real NAL header.
+    if (buf[off] & 0x80) return null;
+    nalus.push(buf.subarray(off, off + len));
+    off += len;
+  }
+  return nalus.length > 0 ? nalus : null;
+}
+
+/**
  * Split an Annex-B buffer into NALUs (no start codes in output).
  * Start codes: 00 00 01 or 00 00 00 01.
  */
-function _splitNALUs(buf) {
+function _splitAnnexB(buf) {
   var nalus = [];
   var i = 0, len = buf.length;
 

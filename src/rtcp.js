@@ -560,7 +560,12 @@ function _buildNackEntries(seqNums) {
     var blp = 0;
     i++;
     while (i < seqNums.length && seqNums[i] - pid <= 16) {
-      blp |= (1 << (seqNums[i] - pid - 1));
+      var diff = seqNums[i] - pid;
+      // Skip duplicates: diff === 0 would compute 1 << -1 (= 1 << 31 in
+      // JS shift semantics), producing a negative blp that makes
+      // writeUInt16BE throw a RangeError. Duplicates carry no
+      // information anyway.
+      if (diff > 0) blp |= (1 << (diff - 1));
       i++;
     }
     entries.push({ pid: pid, blp: blp });

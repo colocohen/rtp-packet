@@ -71,7 +71,7 @@
 // transport-cc extension is stamped.
 //
 
-import { setHeaderExtension, transportCC, absSendTime } from './rtp.js';
+import { setHeaderExtensions, transportCC, absSendTime } from './rtp.js';
 
 
 /**
@@ -123,7 +123,15 @@ function RtpHeaderStamper(opts) {
  * If the extMap has no known keys, the packet is returned unchanged.
  */
 RtpHeaderStamper.prototype.stamp = function (rtpPacket) {
-  var pkt = rtpPacket;
+  // Collect all extensions into one map, then apply them in a SINGLE
+  // setHeaderExtensions() pass — one parse of the existing block and
+  // one output allocation, instead of one per extension. For a WebRTC
+  // sender stamping transport-cc + abs-send-time + mid this cuts the
+  // per-packet allocation/copy work to a third.
+  var batch = this._batchScratch || (this._batchScratch = {});
+  // Clear previous entries (reused object avoids per-packet allocation).
+  for (var k in batch) delete batch[k];
+  var any = false;
 
   // Transport-wide congestion control sequence number. Increment
   // *first*, so the counter starts at 1, not 0 (matching Chrome's
@@ -131,20 +139,23 @@ RtpHeaderStamper.prototype.stamp = function (rtpPacket) {
   var twccId = this._extMap['transport-cc'];
   if (twccId != null) {
     this._twccSeq = (this._twccSeq + 1) & 0xFFFF;
-    pkt = setHeaderExtension(pkt, twccId, transportCC(this._twccSeq));
+    batch[twccId] = transportCC(this._twccSeq);
+    any = true;
   }
 
   // Absolute send time — freshly computed at stamp time, so it reflects
   // the moment the packet is about to go on the wire (after any queuing).
   var absId = this._extMap['abs-send-time'];
   if (absId != null) {
-    pkt = setHeaderExtension(pkt, absId, absSendTime());
+    batch[absId] = absSendTime();
+    any = true;
   }
 
   // MID — constant per transceiver (see a=mid: in SDP).
   var midId = this._extMap['mid'];
   if (midId != null && this._midPayload) {
-    pkt = setHeaderExtension(pkt, midId, this._midPayload);
+    batch[midId] = this._midPayload;
+    any = true;
   }
 
   // RID + repaired-RID (RFC 8852). Both are per-SSRC — simulcast ships
@@ -154,18 +165,19 @@ RtpHeaderStamper.prototype.stamp = function (rtpPacket) {
   var rridId = this._extMap['repaired-rtp-stream-id'];
   if (ridId != null || rridId != null) {
     // Parse SSRC inline — avoid full rtp.parse() on the hot path.
-    var ssrc = (pkt[8] << 24 | pkt[9] << 16 | pkt[10] << 8 | pkt[11]) >>> 0;
+    var ssrc = (rtpPacket[8] << 24 | rtpPacket[9] << 16 | rtpPacket[10] << 8 | rtpPacket[11]) >>> 0;
     if (ridId != null) {
       var ridPayload = this._ridPayloadCache[ssrc];
-      if (ridPayload) pkt = setHeaderExtension(pkt, ridId, ridPayload);
+      if (ridPayload) { batch[ridId] = ridPayload; any = true; }
     }
     if (rridId != null) {
       var rridPayload = this._repairedRidPayloadCache[ssrc];
-      if (rridPayload) pkt = setHeaderExtension(pkt, rridId, rridPayload);
+      if (rridPayload) { batch[rridId] = rridPayload; any = true; }
     }
   }
 
-  return pkt;
+  if (!any) return rtpPacket;
+  return setHeaderExtensions(rtpPacket, batch);
 };
 
 /** The last transport-wide seq actually stamped. Use for pairing with

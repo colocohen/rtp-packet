@@ -18,7 +18,7 @@
 import {
   serialize, parse,
   RTP_HEADER_SIZE, DEFAULT_MTU,
-  parseExtensions, writeExtensions, setHeaderExtension,
+  parseExtensions, writeExtensions, setHeaderExtension, setHeaderExtensions,
   absSendTime, transportCC, audioLevel, readAbsSendTime, readAudioLevel,
 } from './src/rtp.js';
 
@@ -34,7 +34,7 @@ import { AacPacketizer, AacDepacketizer } from './src/aac.js';
 import { DTMFPacketizer, DTMFDepacketizer } from './src/dtmf.js';
 
 import { JitterBuffer } from './src/jitter_buffer.js';
-import { SrtpSession } from './src/srtp.js';
+import { SrtpSession, PROFILE_CM, PROFILE_GCM } from './src/srtp.js';
 import { SenderBuffer, RtxStream, NackThrottle, NackGenerator, Histogram, buildRtxPacket, parseRtxPacket } from './src/retransmit.js';
 import { parseTransportCC, parseREMB, BandwidthEstimator, TransportCCFeedbackGenerator } from './src/bandwidth.js';
 import { RtpHeaderStamper } from './src/rtp_header_stamper.js';
@@ -217,8 +217,11 @@ export {
   generateSDP,
 
   // ── Header extensions (RFC 5285) ──
-  parseExtensions, writeExtensions, setHeaderExtension,
+  parseExtensions, writeExtensions, setHeaderExtension, setHeaderExtensions,
   absSendTime, transportCC, audioLevel, readAbsSendTime, readAudioLevel,
+
+  // ── SRTP profile name constants ──
+  PROFILE_CM, PROFILE_GCM,
 };
 
 export default {
@@ -244,6 +247,7 @@ export default {
   buildSR, buildRR, buildPLI, buildNACK, buildFIR, buildREMB, buildTransportCC,
   buildSDES, buildBYE, buildCompound, parseRTCP, parseRTCPCompound,
   generateSDP,
-  parseExtensions, writeExtensions, setHeaderExtension,
+  parseExtensions, writeExtensions, setHeaderExtension, setHeaderExtensions,
   absSendTime, transportCC, audioLevel, readAbsSendTime, readAudioLevel,
+  PROFILE_CM, PROFILE_GCM,
 };

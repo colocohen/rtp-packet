@@ -24,9 +24,24 @@ var CLOCK_RATE = 90000;
  * @param {number}  opts.payloadType              required, 0-127
  * @param {number} [opts.mtu]                     default 1400
  * @param {number} [opts.initialSequenceNumber]   default random
+ * @param {boolean|number} [opts.pictureId]       emit a 15-bit PictureID in the
+ *                          payload descriptor (draft-ietf-payload-vp9 §4.2,
+ *                          I bit). `true` for a random initial value, or a
+ *                          number for a specific one. Increments once per
+ *                          FRAME, wraps at 2^15. Off by default; turn on for
+ *                          WebRTC/SFU use (frame continuity + layer switching).
  */
 function VP9Packetizer(opts) {
   initPacketizer(this, opts);
+  if (opts && opts.pictureId !== undefined && opts.pictureId !== false) {
+    this._hasPid = true;
+    this._pid = (typeof opts.pictureId === 'number')
+      ? (opts.pictureId & 0x7FFF)
+      : Math.floor(Math.random() * 0x8000);
+  } else {
+    this._hasPid = false;
+    this._pid = 0;
+  }
 }
 
 /**
@@ -76,10 +91,25 @@ function _packetize(self, chunk, withMeta) {
   // miss real keyframes and stall recovery).
   var P = (chunk.type === 'delta') ? 0x40 : 0;
 
+  // With PictureID: descriptor gets I=0x80 and is followed by 2 bytes
+  // of M(1)+PictureID(15). All fragments of a frame share the PID.
+  var hasPid = self._hasPid;
+  var prefixLen = hasPid ? 3 : 1;
+  var I = hasPid ? 0x80 : 0;
+  var pidHi = 0, pidLo = 0;
+  if (hasPid) {
+    var pid = self._pid;
+    self._pid = (pid + 1) & 0x7FFF;
+    pidHi = 0x80 | ((pid >> 8) & 0x7F);   // M=1 → 15-bit
+    pidLo = pid & 0xFF;
+  }
+  // Recompute max payload for the actual prefix size.
+  maxPayload = self.mtu - prefixLen;
+
   // Fast path — single-packet (B=1, E=1, no fragmentation).
   if (data.length <= maxPayload) {
     return [makePacketWithPrefix(
-      self, P | 0x08 | 0x04, 0, 0, 0, 1,   // P + B + E
+      self, I | P | 0x08 | 0x04, pidHi, pidLo, 0, prefixLen,   // (I+)P+B+E
       data, 0, data.length,
       rtpTs, true, withMeta
     )];
@@ -94,14 +124,14 @@ function _packetize(self, chunk, withMeta) {
     var isLast = (i === fragCount - 1);
     var size = Math.min(maxPayload, data.length - offset);
 
-    // VP9 descriptor: P (frame-type, same on every fragment),
-    // B (0x08) on start of frame, E (0x04) on end.
-    var descriptor = P;
+    // VP9 descriptor: I (PictureID present), P (frame-type, same on
+    // every fragment), B (0x08) on start of frame, E (0x04) on end.
+    var descriptor = I | P;
     if (isFirst) descriptor |= 0x08;
     if (isLast)  descriptor |= 0x04;
 
     out.push(makePacketWithPrefix(
-      self, descriptor, 0, 0, 0, 1,
+      self, descriptor, pidHi, pidLo, 0, prefixLen,
       data, offset, size,
       rtpTs, isLast, withMeta
     ));

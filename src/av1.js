@@ -56,17 +56,34 @@ function _packetize(self, chunk, withMeta) {
   var isKey = (chunk.type === 'key');
   var maxPayload = self.mtu - 1;   // -1 for the 1-byte AV1 aggregation header
 
+  // Aggregation header (AV1 RTP spec §4.4):
+  //   Z (0x80) — first OBU element continues a previous fragment
+  //   Y (0x40) — last OBU element continues in the next packet
+  //   W (0x30) — 2-bit OBU element count; W=1 means "exactly one OBU
+  //              element, occupying the rest of the payload, with NO
+  //              leb128 length prefix"
+  //   N (0x08) — start of a new coded video sequence (keyframe)
+  //
+  // We always emit exactly one OBU element per packet, so W MUST be 1.
+  // W=0 would tell the receiver that every element carries a leb128
+  // length prefix — which we don't write — so libwebrtc/Chrome would
+  // misparse the first payload byte as a length. (Our own depacketizer
+  // ignores W and concatenates, which is why round-trip tests passed
+  // while real-world interop would have failed.)
+  var W1 = 0x10;   // W=1 in bits 4-5
+
   // Fast path — single packet (no fragmentation needed).
   if (data.length <= maxPayload) {
     return [makePacketWithPrefix(
-      self, isKey ? 0x08 : 0x00, 0, 0, 0, 1,   // N bit on keyframes
+      self, W1 | (isKey ? 0x08 : 0x00), 0, 0, 0, 1,   // W=1 + N on keyframes
       data, 0, data.length,
       rtpTs, true, withMeta
     )];
   }
 
   // Fragmented: Z (continuation) on all but first, Y (continues) on all but last,
-  // N (new coded video sequence) only on first-and-keyframe.
+  // N (new coded video sequence) only on first-and-keyframe. W=1 on every
+  // fragment — each packet still carries exactly one OBU element.
   var out = [];
   var offset = 0;
   var fragCount = Math.ceil(data.length / maxPayload);
@@ -75,7 +92,7 @@ function _packetize(self, chunk, withMeta) {
     var isLast = (i === fragCount - 1);
     var size = Math.min(maxPayload, data.length - offset);
 
-    var header = 0;
+    var header = W1;
     if (!isFirst) header |= 0x80;            // Z
     if (!isLast)  header |= 0x40;            // Y
     if (isFirst && isKey) header |= 0x08;    // N

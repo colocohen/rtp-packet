@@ -452,11 +452,12 @@ function TransportCCFeedbackGenerator(opts) {
   this._mediaSsrc  = (opts.mediaSsrc  != null) ? (opts.mediaSsrc  >>> 0) : 0;
   this._fbPktCount = 0;
 
-  // Accumulated arrivals since the last buildFeedback() call. Each entry
-  // is { seq: u16, timeMs: number }. Sequence numbers may wrap; we
-  // handle that at build time by tracking the min/max seq with wrap-aware
-  // comparison.
-  this._arrivals = [];
+  // Accumulated arrivals since the last buildFeedback() call, keyed by
+  // seq for O(1) dedup — the previous linear scan was O(n) per packet
+  // (O(n²) per feedback window), which shows up at high packet rates.
+  // Sequence numbers may wrap; we handle that at build time with a
+  // wrap-aware sort.
+  this._arrivalMap = new Map();   // seq → timeMs (first arrival wins)
 }
 
 /**
@@ -467,11 +468,8 @@ function TransportCCFeedbackGenerator(opts) {
 TransportCCFeedbackGenerator.prototype.recordArrival = function (seq, timeMs) {
   if (timeMs == null) timeMs = Date.now();
   var s = seq & 0xFFFF;
-  // Dedup against recent arrivals (cheap: most often seq is monotonic).
-  for (var i = this._arrivals.length - 1; i >= 0; i--) {
-    if (this._arrivals[i].seq === s) return;
-  }
-  this._arrivals.push({ seq: s, timeMs: timeMs });
+  if (this._arrivalMap.has(s)) return;
+  this._arrivalMap.set(s, timeMs);
 };
 
 /**
@@ -482,14 +480,17 @@ TransportCCFeedbackGenerator.prototype.recordArrival = function (seq, timeMs) {
  *                         packets have been recorded.
  */
 TransportCCFeedbackGenerator.prototype.buildFeedback = function () {
-  if (this._arrivals.length === 0) return null;
+  if (this._arrivalMap.size === 0) return null;
 
   // Wrap-aware sort: treat a 16-bit seq space and find a linear ordering.
   // Strategy: pick the minimum "wrap-distance" ordering by sorting around
   // a pivot. In practice, arrivals within a ~100ms window span a handful
   // of sequence numbers with no wrap; we handle the rare wrap case by
   // detecting when the max-min gap exceeds 32768 and shifting.
-  var arrs = this._arrivals.slice();
+  var arrs = [];
+  this._arrivalMap.forEach(function (timeMs, seq) {
+    arrs.push({ seq: seq, timeMs: timeMs });
+  });
   arrs.sort(function (a, b) { return a.seq - b.seq; });
   // Detect wrap: if there's a big gap between adjacent sorted entries,
   // the run actually crosses 0. Shift all entries below the gap by 65536.
@@ -558,13 +559,13 @@ TransportCCFeedbackGenerator.prototype.buildFeedback = function () {
   });
 
   this._fbPktCount = (this._fbPktCount + 1) & 0xFF;
-  this._arrivals = [];
+  this._arrivalMap.clear();
   return pkt;
 };
 
 /** How many arrivals are buffered waiting for the next buildFeedback(). */
 TransportCCFeedbackGenerator.prototype.pending = function () {
-  return this._arrivals.length;
+  return this._arrivalMap.size;
 };
 
 /** Update the media SSRC — used after SDP renegotiation. */
@@ -574,7 +575,7 @@ TransportCCFeedbackGenerator.prototype.setMediaSsrc = function (ssrc) {
 
 /** Clear all pending arrivals without building feedback. */
 TransportCCFeedbackGenerator.prototype.reset = function () {
-  this._arrivals = [];
+  this._arrivalMap.clear();
   this._fbPktCount = 0;
 };
 

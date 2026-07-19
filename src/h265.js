@@ -119,9 +119,15 @@ H265Packetizer.prototype.packetizeWithMeta = function (chunk) {
  *
  * @param {Buffer[]} nalus        raw NALUs (without start codes)
  * @param {number}   timestampUs  microseconds
+ * @param {boolean}  [marker]     marker bit; default true (standalone AP that
+ *                                ends its access unit). Pass false when the
+ *                                AP precedes more packets of the same AU —
+ *                                e.g. VPS+SPS+PPS bundled before an IDR sent
+ *                                as separate FU fragments. Parity with
+ *                                H264Packetizer.packetizeStapA.
  * @returns {Buffer}
  */
-H265Packetizer.prototype.packetizeAP = function (nalus, timestampUs) {
+H265Packetizer.prototype.packetizeAP = function (nalus, timestampUs, marker) {
   if (!nalus || !nalus.length) {
     throw new TypeError('H265Packetizer.packetizeAP: nalus array required');
   }
@@ -153,7 +159,8 @@ H265Packetizer.prototype.packetizeAP = function (nalus, timestampUs) {
     payload.writeUInt16BE(localNalus[j].length, off); off += 2;
     localNalus[j].copy(payload, off); off += localNalus[j].length;
   }
-  return makePacket(this, payload, usToRtp(timestampUs, CLOCK_RATE), true, false);
+  var m = (marker === undefined) ? true : !!marker;
+  return makePacket(this, payload, usToRtp(timestampUs, CLOCK_RATE), m, false);
 };
 
 H265Packetizer.prototype.close = function () {};
@@ -446,6 +453,41 @@ H265Depacketizer.prototype.close = function () {
 // ═══════════════════════════════════════════════════════════════════
 
 function _splitNALUs(buf) {
+  // Auto-detect framing, mirroring h264.js: Annex-B start codes vs.
+  // length-prefixed (hvcC / MP4 / WebCodecs "hevc" format — 4-byte
+  // big-endian lengths). Fall back to the Annex-B splitter, which
+  // treats unframed input as a single NALU (previous behavior).
+  if (!_startsWithStartCode(buf)) {
+    var lp = _trySplitLengthPrefixed(buf);
+    if (lp) return lp;
+  }
+  return _splitAnnexB(buf);
+}
+
+function _startsWithStartCode(buf) {
+  if (buf.length >= 3 && buf[0] === 0 && buf[1] === 0 && buf[2] === 1) return true;
+  if (buf.length >= 4 && buf[0] === 0 && buf[1] === 0 && buf[2] === 0 && buf[3] === 1) return true;
+  return false;
+}
+
+function _trySplitLengthPrefixed(buf) {
+  if (buf.length < 6) return null;
+  var nalus = [];
+  var off = 0;
+  while (off < buf.length) {
+    if (off + 4 > buf.length) return null;
+    var len = buf.readUInt32BE(off);
+    off += 4;
+    if (len === 0 || off + len > buf.length) return null;
+    // H.265 NAL header: forbidden_zero_bit (top bit of byte 0) must be 0.
+    if (buf[off] & 0x80) return null;
+    nalus.push(buf.subarray(off, off + len));
+    off += len;
+  }
+  return nalus.length > 0 ? nalus : null;
+}
+
+function _splitAnnexB(buf) {
   var nalus = [];
   var i = 0, len = buf.length;
 
