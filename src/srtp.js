@@ -74,8 +74,9 @@ var GCM_SALT_LEN     = 12;
 // uses 128). Packets older than maxIndex - REPLAY_WINDOW are rejected.
 var REPLAY_WINDOW = 128;
 
-var PROFILE_CM  = 'AES_CM_128_HMAC_SHA1_80';
-var PROFILE_GCM = 'AEAD_AES_128_GCM';
+var PROFILE_CM      = 'AES_CM_128_HMAC_SHA1_80';
+var PROFILE_GCM     = 'AEAD_AES_128_GCM';
+var PROFILE_GCM_256 = 'AEAD_AES_256_GCM';
 
 /**
  * Normalize a profile identifier to the canonical string form.
@@ -93,15 +94,17 @@ function _normalizeProfile(p) {
   if (typeof p === 'number') {
     if (p === 0x0001) return PROFILE_CM;
     if (p === 0x0007) return PROFILE_GCM;
+    if (p === 0x0008) return PROFILE_GCM_256;
     throw new Error('SrtpSession: unsupported DTLS-SRTP profile number 0x' +
       p.toString(16).padStart(4, '0') +
-      ' (supported: 0x0001 SRTP_AES128_CM_HMAC_SHA1_80, 0x0007 SRTP_AEAD_AES_128_GCM)');
+      ' (supported: 0x0001 SRTP_AES128_CM_HMAC_SHA1_80, 0x0007 SRTP_AEAD_AES_128_GCM, 0x0008 SRTP_AEAD_AES_256_GCM)');
   }
   var s = String(p);
   if (s === PROFILE_CM || s === 'SRTP_AES128_CM_HMAC_SHA1_80') return PROFILE_CM;
   if (s === PROFILE_GCM || s === 'SRTP_AEAD_AES_128_GCM') return PROFILE_GCM;
+  if (s === PROFILE_GCM_256 || s === 'SRTP_AEAD_AES_256_GCM') return PROFILE_GCM_256;
   throw new Error('SrtpSession: unknown profile "' + s +
-    '" (supported: ' + PROFILE_CM + ', ' + PROFILE_GCM + ')');
+    '" (supported: ' + PROFILE_CM + ', ' + PROFILE_GCM + ', ' + PROFILE_GCM_256 + ')');
 }
 
 
@@ -143,13 +146,18 @@ function SrtpSession(arg1, arg2, arg3) {
 
   var profile = _normalizeProfile(opts && opts.profile);
   this.profile = profile;
-  this._gcm = (profile === PROFILE_GCM);
+  this._gcm = (profile === PROFILE_GCM || profile === PROFILE_GCM_256);
+  // RFC 7714 §11.2: AEAD_AES_256_GCM = same construction, 32-byte keys,
+  // KDF runs AES-256-CTR keyed by the 32-byte master key. Everything
+  // else (12-byte salt, 16-byte tag, IV formation) is identical to 128.
+  this._keyLen = (profile === PROFILE_GCM_256) ? 32 : SESSION_KEY_LEN;
+  this._gcmCipher = (profile === PROFILE_GCM_256) ? 'aes-256-gcm' : 'aes-128-gcm';
   this._tagLen = this._gcm ? GCM_TAG_LEN : AUTH_TAG_LEN;
   this._replayEnabled = !(opts && opts.replayProtection === false);
 
   var wantSalt = this._gcm ? GCM_SALT_LEN : CM_SALT_LEN;
-  if (encMasterKey.length !== 16) throw new Error('SrtpSession: masterKey must be 16 bytes');
-  if (decMasterKey.length !== 16) throw new Error('SrtpSession: masterKey must be 16 bytes');
+  if (encMasterKey.length !== this._keyLen) throw new Error('SrtpSession: masterKey must be ' + this._keyLen + ' bytes for ' + profile);
+  if (decMasterKey.length !== this._keyLen) throw new Error('SrtpSession: masterKey must be ' + this._keyLen + ' bytes for ' + profile);
   if (encMasterSalt.length !== wantSalt || decMasterSalt.length !== wantSalt) {
     throw new Error('SrtpSession: masterSalt must be ' + wantSalt + ' bytes for ' + profile);
   }
@@ -162,14 +170,14 @@ function SrtpSession(arg1, arg2, arg3) {
   var encKdfSalt = _kdfSalt(encMasterSalt);
   var decKdfSalt = _kdfSalt(decMasterSalt);
 
-  this._encRtpKey   = _deriveKey(encMasterKey, encKdfSalt, LABEL_RTP_CIPHER,  SESSION_KEY_LEN);
+  this._encRtpKey   = _deriveKey(encMasterKey, encKdfSalt, LABEL_RTP_CIPHER,  this._keyLen);
   this._encRtpSalt  = _deriveKey(encMasterKey, encKdfSalt, LABEL_RTP_SALT,    saltLen);
-  this._encRtcpKey  = _deriveKey(encMasterKey, encKdfSalt, LABEL_RTCP_CIPHER, SESSION_KEY_LEN);
+  this._encRtcpKey  = _deriveKey(encMasterKey, encKdfSalt, LABEL_RTCP_CIPHER, this._keyLen);
   this._encRtcpSalt = _deriveKey(encMasterKey, encKdfSalt, LABEL_RTCP_SALT,   saltLen);
 
-  this._decRtpKey   = _deriveKey(decMasterKey, decKdfSalt, LABEL_RTP_CIPHER,  SESSION_KEY_LEN);
+  this._decRtpKey   = _deriveKey(decMasterKey, decKdfSalt, LABEL_RTP_CIPHER,  this._keyLen);
   this._decRtpSalt  = _deriveKey(decMasterKey, decKdfSalt, LABEL_RTP_SALT,    saltLen);
-  this._decRtcpKey  = _deriveKey(decMasterKey, decKdfSalt, LABEL_RTCP_CIPHER, SESSION_KEY_LEN);
+  this._decRtcpKey  = _deriveKey(decMasterKey, decKdfSalt, LABEL_RTCP_CIPHER, this._keyLen);
   this._decRtcpSalt = _deriveKey(decMasterKey, decKdfSalt, LABEL_RTCP_SALT,   saltLen);
 
   if (!this._gcm) {
@@ -245,7 +253,7 @@ SrtpSession.prototype.encryptRtp = function (rtpPacket) {
     // ── RFC 7714 §8: AES-GCM ──
     _buildGcmRtpIv(this._ivScratch, this._encRtpSalt, ssrc, roc, seq);
     var iv = this._ivScratch.subarray(0, 12);
-    var cipher = crypto.createCipheriv('aes-128-gcm', this._encRtpKey, iv, { authTagLength: GCM_TAG_LEN });
+    var cipher = crypto.createCipheriv(this._gcmCipher, this._encRtpKey, iv, { authTagLength: GCM_TAG_LEN });
     cipher.setAAD(rtpPacket.subarray(0, headerLen));
     var ct = cipher.update(payload);
     cipher.final();
@@ -322,7 +330,7 @@ SrtpSession.prototype.decryptRtp = function (srtpPacket) {
     _buildGcmRtpIv(this._ivScratch, this._decRtpSalt, ssrc, guessRoc, seq);
     var iv = this._ivScratch.subarray(0, 12);
     try {
-      var decipher = crypto.createDecipheriv('aes-128-gcm', this._decRtpKey, iv, { authTagLength: GCM_TAG_LEN });
+      var decipher = crypto.createDecipheriv(this._gcmCipher, this._decRtpKey, iv, { authTagLength: GCM_TAG_LEN });
       decipher.setAAD(srtpPacket.subarray(0, headerLen));
       decipher.setAuthTag(srtpPacket.subarray(tagStart));
       var pt = decipher.update(srtpPacket.subarray(ctStart, tagStart));
@@ -397,7 +405,7 @@ SrtpSession.prototype.encryptRtcp = function (rtcpPacket) {
     rtcpPacket.copy(this._aadScratch, 0, 0, 8);
     this._aadScratch.writeUInt32BE(indexWord, 8);
 
-    var cipher = crypto.createCipheriv('aes-128-gcm', this._encRtcpKey, iv, { authTagLength: GCM_TAG_LEN });
+    var cipher = crypto.createCipheriv(this._gcmCipher, this._encRtcpKey, iv, { authTagLength: GCM_TAG_LEN });
     cipher.setAAD(this._aadScratch);
     var ct = cipher.update(payload);
     cipher.final();
@@ -489,7 +497,7 @@ SrtpSession.prototype._decryptRtcpGcm = function (srtcpPacket) {
   this._aadScratch.writeUInt32BE(indexWord, 8);
 
   try {
-    var decipher = crypto.createDecipheriv('aes-128-gcm', this._decRtcpKey, iv, { authTagLength: GCM_TAG_LEN });
+    var decipher = crypto.createDecipheriv(this._gcmCipher, this._decRtcpKey, iv, { authTagLength: GCM_TAG_LEN });
     // For unencrypted-but-authenticated packets (E=0), the "ciphertext"
     // region is still covered by the tag as AAD-style data. We only
     // support E=1 for GCM here — WebRTC always encrypts RTCP.
@@ -551,8 +559,9 @@ SrtpSession.prototype.unprotectRtcp = SrtpSession.prototype.decryptRtcp;
  */
 SrtpSession.keyingMaterialLength = function (profile) {
   var p = _normalizeProfile(profile);
-  var saltLen = (p === PROFILE_GCM) ? GCM_SALT_LEN : CM_SALT_LEN;
-  return 2 * SESSION_KEY_LEN + 2 * saltLen;
+  var saltLen = (p === PROFILE_GCM || p === PROFILE_GCM_256) ? GCM_SALT_LEN : CM_SALT_LEN;
+  var keyLen  = (p === PROFILE_GCM_256) ? 32 : SESSION_KEY_LEN;
+  return 2 * keyLen + 2 * saltLen;   // CM: 60, GCM-128: 56, GCM-256: 88
 };
 
 /**
@@ -582,8 +591,8 @@ SrtpSession.keyingMaterialLength = function (profile) {
 SrtpSession.fromDtlsKeyingMaterial = function (profile, keyingMaterial, isServer, opts) {
   var p = _normalizeProfile(profile);
   var km = _asBuffer(keyingMaterial, 'keyingMaterial');
-  var keyLen = SESSION_KEY_LEN;
-  var saltLen = (p === PROFILE_GCM) ? GCM_SALT_LEN : CM_SALT_LEN;
+  var keyLen = (p === PROFILE_GCM_256) ? 32 : SESSION_KEY_LEN;
+  var saltLen = (p === PROFILE_GCM || p === PROFILE_GCM_256) ? GCM_SALT_LEN : CM_SALT_LEN;
   var want = 2 * keyLen + 2 * saltLen;
   if (km.length !== want) {
     throw new Error('SrtpSession.fromDtlsKeyingMaterial: expected ' + want +
@@ -794,7 +803,8 @@ function _deriveKey(masterKey, masterSalt, label, length) {
   iv[7] ^= label;            // byte 7: salt[7] XOR label
   // bytes 14..15 stay zero — this is the counter start
 
-  var cipher = crypto.createCipheriv('aes-128-ctr', masterKey, iv);
+  var kdfCipher = (masterKey.length === 32) ? 'aes-256-ctr' : 'aes-128-ctr';
+  var cipher = crypto.createCipheriv(kdfCipher, masterKey, iv);
   var derived = cipher.update(Buffer.alloc(length <= 16 ? 16 : 32));
   cipher.final();
   return derived.subarray(0, length);
@@ -811,5 +821,5 @@ function _constantTimeEquals(a, b) {
 }
 
 
-export { SrtpSession, AUTH_TAG_LEN, GCM_TAG_LEN, PROFILE_CM, PROFILE_GCM };
+export { SrtpSession, AUTH_TAG_LEN, GCM_TAG_LEN, PROFILE_CM, PROFILE_GCM, PROFILE_GCM_256 };
 export default SrtpSession;

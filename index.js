@@ -34,7 +34,7 @@ import { AacPacketizer, AacDepacketizer } from './src/aac.js';
 import { DTMFPacketizer, DTMFDepacketizer } from './src/dtmf.js';
 
 import { JitterBuffer } from './src/jitter_buffer.js';
-import { SrtpSession, PROFILE_CM, PROFILE_GCM } from './src/srtp.js';
+import { SrtpSession, PROFILE_CM, PROFILE_GCM, PROFILE_GCM_256 } from './src/srtp.js';
 import { REDPacketizer, REDDepacketizer } from './src/red.js';
 import { FlexFecEncoder, FlexFecDecoder } from './src/flexfec.js';
 import { SenderBuffer, RtxStream, NackThrottle, NackGenerator, Histogram, buildRtxPacket, parseRtxPacket } from './src/retransmit.js';
@@ -225,7 +225,7 @@ export {
   absSendTime, transportCC, audioLevel, readAbsSendTime, readAudioLevel,
 
   // ── SRTP profile name constants ──
-  PROFILE_CM, PROFILE_GCM,
+  PROFILE_CM, PROFILE_GCM, PROFILE_GCM_256,
 };
 
 export default {
@@ -253,5 +253,5 @@ export default {
   generateSDP,
   parseExtensions, writeExtensions, setHeaderExtension, setHeaderExtensions,
   absSendTime, transportCC, audioLevel, readAbsSendTime, readAudioLevel,
-  PROFILE_CM, PROFILE_GCM,
+  PROFILE_CM, PROFILE_GCM, PROFILE_GCM_256,
 };
