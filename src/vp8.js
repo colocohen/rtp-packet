@@ -7,7 +7,7 @@
 
 import {
   initPacketizer, makePacketWithPrefix, validateChunk, usToRtp,
-  initDepacketizer, emitError, _toBuffer,
+  initDepacketizer, emitError, checkDepacketizePayload, _toBuffer,
 } from './rtp.js';
 
 var CLOCK_RATE = 90000;
@@ -219,10 +219,7 @@ VP8Depacketizer.peekKeyframe = function (payload) {
  * @param {object} packet — { payload, marker, timestamp, ... }
  */
 VP8Depacketizer.prototype.depacketize = function (packet) {
-  if (!packet || !packet.payload || packet.payload.length < 1) {
-    emitError(this, new Error('VP8Depacketizer: empty or missing payload'));
-    return;
-  }
+  if (!checkDepacketizePayload(this, packet, 1)) return;
 
   var payload = packet.payload;
   var S = !!(payload[0] & 0x10);

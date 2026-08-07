@@ -29,7 +29,7 @@
 
 import {
   initPacketizer, makePacket, validateChunk, usToRtp,
-  initDepacketizer, emitError, _toBuffer,
+  initDepacketizer, emitError, checkDepacketizePayload, _toBuffer,
 } from './rtp.js';
 
 var MAX_TS_OFFSET = 0x3FFF;   // 14-bit
@@ -146,7 +146,13 @@ function REDDepacketizer(opts) {
 }
 
 REDDepacketizer.prototype.depacketize = function (pkt) {
-  if (!pkt || !pkt.payload) return;
+  // minLen 1: a RED payload needs at least the 1-byte primary header.
+  // This also FIXES two previous inconsistencies: a missing payload was
+  // swallowed silently (now reported, matching every other codec), and a
+  // zero-length payload (padding-only probe) fell through into _parseRed
+  // and was reported as 'RED: malformed payload' (now silently ignored —
+  // it's valid RTP carrying nothing).
+  if (!checkDepacketizePayload(this, pkt, 1)) return;
   var p = _toBuffer(pkt.payload);
   var blocks = _parseRed(p);
   if (!blocks) { emitError(this, new Error('RED: malformed payload')); return; }
@@ -215,7 +221,14 @@ function _parseRed(p) {
 }
 
 REDDepacketizer.prototype.reset = function () { this._seen.clear(); };
-REDDepacketizer.prototype.close = function () { this._seen.clear(); };
+/** Release resources. Safe to call multiple times; depacketize() after
+ *  close() is silently ignored (callbacks are nulled, same as every
+ *  other codec's depacketizer). */
+REDDepacketizer.prototype.close = function () {
+  this._seen.clear();
+  this._output = null;
+  this._error = null;
+};
 
 /** Keyframe peek — audio has no keyframes; kept for interface parity. */
 REDDepacketizer.peekKeyframe = function () { return false; };

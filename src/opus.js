@@ -8,7 +8,7 @@
 
 import {
   initPacketizer, makePacket, validateChunk, usToRtp,
-  initDepacketizer, emitError, _toBuffer,
+  initDepacketizer, emitError, checkDepacketizePayload, _toBuffer,
 } from './rtp.js';
 
 var CLOCK_RATE = 48000;  // Opus always uses 48 kHz RTP clock regardless of sample rate
@@ -150,16 +150,17 @@ function OpusDepacketizer(opts) {
 OpusDepacketizer.peekKeyframe = function () { return false; };
 
 OpusDepacketizer.prototype.depacketize = function (packet) {
-  if (!packet || !packet.payload || packet.payload.length < 1) {
-    emitError(this, new Error('OpusDepacketizer: empty or missing payload'));
-    return;
-  }
+  if (!checkDepacketizePayload(this, packet, 1)) return;
 
-  // Audio: every frame is independently decodable — always 'key'
+  // Audio: every frame is independently decodable — always 'key'.
+  // Surface the marker bit so consumers can detect talkspurt starts
+  // (RFC 7587 §4.2: first packet after silence carries M=1). G711/G722
+  // already expose it; Opus was the odd one out.
   this._output({
     data: packet.payload,
     timestamp: packet.timestamp,
     type: 'key',
+    marker: !!packet.marker,
   });
 };
 

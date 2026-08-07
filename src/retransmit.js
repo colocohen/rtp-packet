@@ -209,15 +209,37 @@ function parseRtxPacket(rtxPkt, opts) {
     var extLen = rtxPkt.readUInt16BE(headerLen + 2);   // in 32-bit words
     headerLen += 4 + extLen * 4;
   }
-  // Need at least header + 2-byte OSN.
-  if (rtxPkt.length < headerLen + 2) return null;
+
+  // RFC 3550 padding must be excluded BEFORE locating the OSN. Chrome's
+  // bandwidth probes arrive on the RTX SSRC as padding-only packets:
+  // P bit set, padding bytes only, no OSN, no wrapped media. Reading the
+  // padding bytes as if they were an OSN fabricated a "recovered" primary
+  // packet with seq=0 (padding is zeros) and garbage payload — observed
+  // live as runs of seq=0 packets injected into the media pipeline,
+  // poisoning the NackGenerator window and the jitter buffer's resync
+  // heuristic. Same RFC 3550 §5.1 validation as parse(): a pad count of
+  // 0 or one that exceeds the packet is ignored, not honored.
+  var payloadEnd = rtxPkt.length;
+  if (rtxPkt[0] & 0x20) {
+    var padLen = rtxPkt[rtxPkt.length - 1];
+    if (padLen >= 1 && headerLen + padLen <= rtxPkt.length) payloadEnd -= padLen;
+  }
+
+  // Need at least a 2-byte OSN of real (non-padding) payload. A padding-
+  // only probe has none — it repairs nothing and stops here; it already
+  // served its purpose by being received and counted for BWE.
+  if (payloadEnd < headerLen + 2) return null;
 
   var osn        = rtxPkt.readUInt16BE(headerLen);
-  var payloadLen = rtxPkt.length - headerLen - 2;
+  var payloadLen = payloadEnd - headerLen - 2;
 
   // [copy of header] || [original payload (skipping OSN)]
   var out = Buffer.allocUnsafe(headerLen + payloadLen);
   rtxPkt.copy(out, 0, 0, headerLen);
+
+  // Clear the P bit — the padding bytes were not copied into the
+  // reconstructed packet, so advertising padding would corrupt parse().
+  out[0] = out[0] & ~0x20;
 
   // Patch PT (preserve marker bit): byte 1 = M (1 bit) | PT (7 bits).
   out[1] = (rtxPkt[1] & 0x80) | (opts.primaryPt & 0x7F);
@@ -228,8 +250,9 @@ function parseRtxPacket(rtxPkt, opts) {
   // Patch SSRC to primary's.
   out.writeUInt32BE(opts.primarySsrc >>> 0, 8);
 
-  // Copy payload after the OSN.
-  rtxPkt.copy(out, headerLen, headerLen + 2);
+  // Copy payload after the OSN, stopping at payloadEnd — trailing padding
+  // (if any) stays behind, matching the cleared P bit above.
+  rtxPkt.copy(out, headerLen, headerLen + 2, payloadEnd);
 
   return out;
 }

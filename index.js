@@ -39,6 +39,7 @@ import { REDPacketizer, REDDepacketizer } from './src/red.js';
 import { FlexFecEncoder, FlexFecDecoder } from './src/flexfec.js';
 import { SenderBuffer, RtxStream, NackThrottle, NackGenerator, Histogram, buildRtxPacket, parseRtxPacket } from './src/retransmit.js';
 import { parseTransportCC, parseREMB, BandwidthEstimator, TransportCCFeedbackGenerator } from './src/bandwidth.js';
+import { RtpForwarder } from './src/forward.js';
 import { RtpHeaderStamper } from './src/rtp_header_stamper.js';
 
 import {
@@ -216,6 +217,12 @@ export {
   // ── Sender-side RTP header extension stamping ──
   RtpHeaderStamper,
 
+  // ── Stream forwarding (SFU rewriting) ──
+  // Per-consumer SSRC/PT/seq/ts rewriting for selective forwarding.
+  // Delta-preserving (loss gaps survive → consumers can NACK) with
+  // switchSource() re-basing for simulcast layer switches.
+  RtpForwarder,
+
   // ── SDP ──
   generateSDP,
 
@@ -247,6 +254,7 @@ export default {
   NackGenerator, Histogram, parseRtxPacket,
   parseTransportCC, parseREMB, BandwidthEstimator, TransportCCFeedbackGenerator,
   RtpHeaderStamper,
+  RtpForwarder,
   buildSR, buildRR, buildPLI, buildNACK, buildFIR, buildREMB, buildTransportCC,
   buildSDES, buildBYE, buildCompound, parseRTCP, parseRTCPCompound,
   generateSDP,

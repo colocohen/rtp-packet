@@ -7,7 +7,7 @@
 
 import {
   initPacketizer, makePacketWithPrefix, validateChunk, usToRtp,
-  initDepacketizer, emitError, _toBuffer,
+  initDepacketizer, emitError, checkDepacketizePayload, _toBuffer,
 } from './rtp.js';
 
 var CLOCK_RATE = 90000;
@@ -160,10 +160,7 @@ AV1Depacketizer.peekKeyframe = function (payload) {
 };
 
 AV1Depacketizer.prototype.depacketize = function (packet) {
-  if (!packet || !packet.payload || packet.payload.length < 1) {
-    emitError(this, new Error('AV1Depacketizer: empty or missing payload'));
-    return;
-  }
+  if (!checkDepacketizePayload(this, packet, 1)) return;
 
   var payload = packet.payload;
   var hdr = payload[0];

@@ -16,6 +16,7 @@ Works anywhere RTP is spoken: WebRTC, RTSP, SIP, WHIP/WHEP, plain RTP-over-UDP.
   - [RTP core](#rtp-core)
   - [Packetizers](#packetizers)
   - [Depacketizers](#depacketizers)
+  - [Stream forwarding (SFU rewriting)](#stream-forwarding-sfu-rewriting)
   - [Factory helpers](#factory-helpers)
   - [JitterBuffer](#jitterbuffer)
   - [SRTP](#srtp)
@@ -161,7 +162,7 @@ const buf = serialize({
 });
 ```
 
-**`parse(buffer) → object | null`** — parse a received buffer; returns `null` if not valid RTP.
+**`parse(buffer) → object | null`** — parse a received buffer; returns `null` if not valid RTP. When the P (padding) bit is set, the padding bytes are stripped from `payload` (a padding-only packet yields `payload.length === 0`); a pad count that violates RFC 3550 §5.1 (zero, or larger than the packet can hold) is ignored rather than corrupting the payload.
 
 The returned object has: `version`, `padding`, `extension`, `csrcCount`, `marker`, `payloadType`, `sequenceNumber`, `timestamp`, `ssrc`, `csrc[]`, `payload`, `headerLength`, and `extensions` — a `{ id: Buffer }` map of parsed RFC 5285 one-byte header extensions (or `null` if the packet has none).
 
@@ -255,6 +256,9 @@ import { H264Depacketizer } from 'rtp-packet';
 const d = new H264Depacketizer({
   output: (chunk) => {
     // chunk: { data: Buffer, timestamp: number, type: 'key'|'delta' }
+    // Audio codecs (Opus, G.711, G.722) also include marker: boolean —
+    // the RTP marker bit, set on the first packet after silence
+    // (talkspurt start), useful for VAD-driven UI or comfort noise.
     decoder.decode(chunk);
   },
   error: (err) => console.error(err),  // optional
@@ -267,9 +271,25 @@ d.depacketize(parsedRtpPacket);
 
 **`reset()`** — clear in-progress reassembly state (e.g., on SSRC change).
 
-**`close()`** — release resources.
+**`close()`** — release resources. Idempotent. After `close()`, further `depacketize()` calls are **silently ignored** (WebCodecs-style) — safe against callbacks that race teardown, e.g. a `JitterBuffer` flush timer firing after the consumer shut down.
 
 Depacketizers expect packets in sequence-number order. On lossy or reordering networks, feed them through a `JitterBuffer` first.
+
+#### Padding-only packets are ignored, not errors
+
+WebRTC endpoints send RTP packets that carry **no media at all** — the P (padding) bit set, padding bytes only. Chrome/libwebrtc uses these for bandwidth probing (BWE ramp-up) and to sustain a minimum send rate, both on media SSRCs and wrapped in RTX. `parse()` strips the padding, leaving `payload.length === 0`.
+
+These are **valid RTP**, and every depacketizer **silently ignores them**: no `output()`, no `error()`. The `error` callback fires only for a *missing* payload — i.e. an argument that isn't a `parse()`-shaped packet at all, which indicates a caller bug.
+
+Padding packets legitimately occupy sequence numbers. When using a `JitterBuffer`, feed them through it normally — filtering them out *before* the buffer would create phantom gaps and spurious loss reports / NACKs.
+
+#### Output framing per codec
+
+**H.264 / H.265** — the depacketizer emits **Annex-B** (start-code-delimited) access units in `chunk.data`, regardless of whether the packetizer input was Annex-B or length-prefixed (AVCC/hvcC). Consumers comparing output to input byte-for-byte should compare NALU contents, not the framing.
+
+**VP8 / VP9 / AV1 / audio codecs** — `chunk.data` is the raw codec bitstream, byte-exact with the packetizer input.
+
+**DTMF** — the depacketizer accepts either a parsed packet or a raw payload Buffer, emits one event per completed key press (`{ tone, event, volume, duration, timestamp }`), and dedupes the RFC 4733 triple-sent end packets by event timestamp. Like all other depacketizers it exposes `reset()` and `close()`.
 
 ### Factory helpers
 
@@ -670,6 +690,47 @@ pkt = setHeaderExtensions(pkt, {                          // or batched —
 });
 ```
 
+### Stream forwarding (SFU rewriting)
+
+The primitive an SFU is built on: re-emit packets received from a producer
+toward a consumer as one clean, continuous stream — the consumer's own
+SSRC, its own sequence space, its own timestamp timeline — without
+touching the encoded payload.
+
+```js
+import { RtpForwarder } from 'rtp-packet';
+
+// one instance per (source stream → consumer)
+const fwd = new RtpForwarder({
+  ssrc: 0xCAFE0001,     // outgoing SSRC (the consumer's connection)
+  payloadType: 96,      // outgoing PT (the consumer's negotiation)
+  // startSeq, startTs  // optional; random by default
+});
+
+const out = fwd.forward(incomingPacket);   // new Buffer, or null if not RTP
+if (out) send(out);
+
+// simulcast layer switch / producer replacement: the next packet's
+// arbitrary numbering will land at lastSeq+1, lastTs+jump
+fwd.switchSource(3000 /* RTP-clock units, e.g. one 30fps frame @90kHz */);
+
+fwd.getState();  // { ssrc, payloadType, forwarded, lastOutputSeq, lastOutputTimestamp }
+```
+
+Semantics (the delta-preserving model):
+
+- **Exactly ten header bytes are rewritten** (PT preserving the marker,
+  sequence, timestamp, SSRC). CSRCs, header extensions, payload and
+  padding pass through untouched; the input buffer is never mutated.
+- **Upstream loss gaps are preserved.** If the producer's packet never
+  reached you, the consumer sees the gap — so it can NACK, and your
+  sender buffer serves the retransmission. Collapsing gaps would blind
+  the consumer to loss.
+- **`switchSource()` re-bases** from the *latest* forwarded packet
+  (wrap-safe, reorder-safe): output sequence continues contiguously and
+  the timestamp advances by your estimate of elapsed media time.
+- Input sequence/timestamp wraparound is transparent.
+
 ## Performance
 
 Measured on Node.js 22, single thread:
@@ -787,6 +848,33 @@ This keeps rtp-packet at ~5000 lines and minimal dependencies, while letting it 
 
 
 ## Changelog
+
+### 0.5.0
+
+**Stream forwarding (SFU primitive)**
+
+- New module `src/forward.js` — `RtpForwarder`: per-consumer rewriting of
+  SSRC / payload type / sequence / timestamp for selective forwarding.
+  Delta-preserving (upstream loss gaps survive so consumers can NACK),
+  wrap-safe, reorder-safe `switchSource()` re-basing for simulcast layer
+  switches. Seven new tests (suite: 85 green).
+
+### 0.4.0
+
+**Padding-packet semantics** (behavior change)
+
+- Every depacketizer now **silently ignores** packets whose payload is empty or below the codec's minimum (padding-only BWE probes from Chrome/libwebrtc, RTX-wrapped probes that unwrap to an empty payload). Previously these valid packets were reported through the `error` callback as `"empty or missing payload"` — log spam on every WebRTC session's ramp-up. The `error` callback now fires only for a *missing* payload (a non-`parse()`-shaped argument, i.e. a caller bug). Shared entry validation lives in one place (`checkDepacketizePayload` in `rtp.js`) instead of ten per-codec copies.
+- `parse()` validates the padding count per RFC 3550 §5.1: a hostile/corrupt pad count (0, or larger than the packet can hold) is ignored rather than silently swallowing media bytes.
+
+**Lifecycle hardening**
+
+- `depacketize()` after `close()` is now a silent no-op on every codec (WebCodecs-style). Previously it crashed with `this._output is not a function` — reachable in practice via a `JitterBuffer` flush timer firing after teardown.
+- `REDDepacketizer.close()` now nulls its callbacks like every other codec (it previously only cleared the dedup window).
+- `DTMFDepacketizer` gains `reset()` and `close()` for interface parity — generic teardown code can now close any depacketizer uniformly.
+
+**API additions**
+
+- Opus depacketizer output now includes `marker` (talkspurt start per RFC 7587 §4.2), matching G.711/G.722.
 
 ### 0.3.0
 

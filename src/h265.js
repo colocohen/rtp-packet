@@ -63,7 +63,7 @@
 
 import {
   initPacketizer, makePacket, makePacketWithPrefix, validateChunk, usToRtp,
-  initDepacketizer, emitError, _toBuffer,
+  initDepacketizer, emitError, checkDepacketizePayload, _toBuffer,
 } from './rtp.js';
 
 var CLOCK_RATE = 90000;
@@ -342,10 +342,9 @@ H265Depacketizer.peekKeyframe = function (payload) {
 };
 
 H265Depacketizer.prototype.depacketize = function (packet) {
-  if (!packet || !packet.payload || packet.payload.length < 2) {
-    emitError(this, new Error('H265Depacketizer: payload must be at least 2 bytes (NAL header)'));
-    return;
-  }
+  // minLen 2: the H265 NAL header itself is two bytes — anything shorter
+  // (including zero-length padding probes) carries nothing parseable.
+  if (!checkDepacketizePayload(this, packet, 2)) return;
 
   var payload = packet.payload;
   var naluType = (payload[0] >> 1) & 0x3F;

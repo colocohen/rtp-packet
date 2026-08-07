@@ -26,7 +26,7 @@
 
 import {
   initPacketizer, makePacket, validateChunk, usToRtp,
-  initDepacketizer, emitError, _toBuffer,
+  initDepacketizer, emitError, checkDepacketizePayload, _toBuffer,
 } from './rtp.js';
 
 var CLOCK_RATE = 8000;  // RFC 3551 §4.5 — fixed for both PCMU and PCMA
@@ -170,10 +170,7 @@ G711Depacketizer.peekKeyframe = function () { return false; };
  * @param {object} packet — { payload, marker, timestamp, ... }
  */
 G711Depacketizer.prototype.depacketize = function (packet) {
-  if (!packet || !packet.payload || packet.payload.length < 1) {
-    emitError(this, new Error('G711Depacketizer: empty or missing payload'));
-    return;
-  }
+  if (!checkDepacketizePayload(this, packet, 1)) return;
 
   // Audio: every block is independently decodable — always 'key'.
   // Surface the marker bit so consumers can detect talkspurt starts

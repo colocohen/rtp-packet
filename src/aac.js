@@ -84,7 +84,7 @@
 
 import {
   initPacketizer, makePacket, validateChunk, usToRtp,
-  initDepacketizer, emitError, _toBuffer,
+  initDepacketizer, emitError, checkDepacketizePayload, _toBuffer,
 } from './rtp.js';
 
 
@@ -307,10 +307,9 @@ AacDepacketizer.peekKeyframe = function () { return false; };
  * @param {object} packet — { payload, marker, timestamp, ... }
  */
 AacDepacketizer.prototype.depacketize = function (packet) {
-  if (!packet || !packet.payload || packet.payload.length < AU_HEADERS_LENGTH_PREFIX_BYTES) {
-    emitError(this, new Error('AacDepacketizer: payload too short for AU-headers-length prefix'));
-    return;
-  }
+  // minLen = the 16-bit AU-headers-length prefix — anything shorter
+  // (including zero-length padding probes) carries nothing parseable.
+  if (!checkDepacketizePayload(this, packet, AU_HEADERS_LENGTH_PREFIX_BYTES)) return;
 
   var payload = packet.payload;
   var auHeadersLengthBits = payload.readUInt16BE(0);

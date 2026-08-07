@@ -90,6 +90,7 @@ function RtpHeaderStamper(opts) {
   opts = opts || {};
   this._extMap      = opts.extMap || {};
   this._mid         = opts.mid != null ? String(opts.mid) : null;
+  this._midBySsrc   = {};        // ssrc → pre-encoded mid payload (per-stream override)
   this._twccSeq     = (opts.initialTransportCcSeq | 0) & 0xFFFF;
 
   // Per-SSRC RID / repaired-RID mappings. Simulcast ships multiple SSRCs
@@ -162,11 +163,22 @@ RtpHeaderStamper.prototype.stamp = function (rtpPacket, hints) {
     any = true;
   }
 
-  // MID — constant per transceiver (see a=mid: in SDP).
+  // MID — resolved per packet: per-SSRC registration wins (BUNDLE
+  // sessions send multiple m-lines, each with its own mid, and an SFU
+  // injects streams whose mids the constructor never knew — found live:
+  // forwarded packets carried the PRODUCER session's mid and Chrome's
+  // mid-priority bundle demux dropped every one). Constructor mid stays
+  // as the single-transceiver fallback. SSRC peek mirrors the RID path
+  // below (bytes 8-11).
   var midId = this._extMap['mid'];
-  if (midId != null && this._midPayload) {
-    batch[midId] = this._midPayload;
-    any = true;
+  if (midId != null) {
+    var _pktSsrcM = ((rtpPacket[8] << 24) | (rtpPacket[9] << 16) |
+                     (rtpPacket[10] << 8) | rtpPacket[11]) >>> 0;
+    var _midP = this._midBySsrc[_pktSsrcM] || this._midPayload;
+    if (_midP) {
+      batch[midId] = _midP;
+      any = true;
+    }
   }
 
   // RID + repaired-RID (RFC 8852). Both are per-SSRC — simulcast ships
@@ -218,6 +230,16 @@ RtpHeaderStamper.prototype.setMid = function (mid) {
  * @param {number} ssrc — the layer's primary SSRC
  * @param {string} rid  — the RID identifier (matches a=rid: in SDP)
  */
+/**
+ * Register the mid to stamp for packets of a specific SSRC — overrides the
+ * constructor-level mid for that stream. null clears the override.
+ */
+RtpHeaderStamper.prototype.setMidForSsrc = function (ssrc, mid) {
+  if (ssrc == null) return;
+  if (mid == null) { delete this._midBySsrc[ssrc >>> 0]; return; }
+  this._midBySsrc[ssrc >>> 0] = Buffer.from(String(mid), 'utf8');
+};
+
 RtpHeaderStamper.prototype.setRidForSsrc = function (ssrc, rid) {
   if (ssrc == null) return;
   var key = ssrc >>> 0;
@@ -236,6 +258,7 @@ RtpHeaderStamper.prototype.setRidForSsrc = function (ssrc, rid) {
  * SSRC→RID entries from accumulating across transceiver lifecycles.
  */
 RtpHeaderStamper.prototype.clearSsrc = function (ssrc) {
+  delete this._midBySsrc[ssrc >>> 0];
   if (ssrc == null) return;
   var key = ssrc >>> 0;
   delete this._ridBySsrc[key];

@@ -42,7 +42,7 @@
 
 import {
   initPacketizer, makePacket, validateChunk, usToRtp,
-  initDepacketizer, emitError, _toBuffer,
+  initDepacketizer, emitError, checkDepacketizePayload, _toBuffer,
 } from './rtp.js';
 
 // RFC 3551 §4.5.2 — RTP clock for G.722 is 8 kHz, NOT the 16 kHz
@@ -180,10 +180,7 @@ G722Depacketizer.peekKeyframe = function () { return false; };
  * @param {object} packet — { payload, marker, timestamp, ... }
  */
 G722Depacketizer.prototype.depacketize = function (packet) {
-  if (!packet || !packet.payload || packet.payload.length < 1) {
-    emitError(this, new Error('G722Depacketizer: empty or missing payload'));
-    return;
-  }
+  if (!checkDepacketizePayload(this, packet, 1)) return;
 
   // Audio: every block is independently decodable — always 'key'.
   // Surface the marker bit so consumers can detect talkspurt starts.

@@ -160,7 +160,8 @@ function DTMFDepacketizer(opts) {
   this._lastEndTs = null;
 }
 DTMFDepacketizer.prototype.depacketize = function (pkt) {
-  var payload = pkt.payload || pkt;
+  if (!this._output) return;                 // closed — ignore (parity with other codecs)
+  var payload = pkt && (pkt.payload || pkt);
   var ev = parseDtmf(payload);
   if (!ev) return;
   if (ev.end) {
@@ -170,6 +171,19 @@ DTMFDepacketizer.prototype.depacketize = function (pkt) {
     this._output({ tone: ev.tone, event: ev.event, volume: ev.volume,
                    duration: ev.duration, timestamp: ts });
   }
+};
+
+/** Clear duplicate-suppression state (e.g. on SSRC change). Interface
+ *  parity with every other codec's depacketizer. */
+DTMFDepacketizer.prototype.reset = function () {
+  this._lastEndTs = null;
+};
+
+/** Release resources. Safe to call multiple times; depacketize() after
+ *  close() is silently ignored. Interface parity with the other codecs. */
+DTMFDepacketizer.prototype.close = function () {
+  this._lastEndTs = null;
+  this._output = null;
 };
 
 // Registry-facing aliases (index.js maps 'dtmf'/'telephone-event' to these)

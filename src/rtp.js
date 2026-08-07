@@ -170,7 +170,16 @@ function parse(buf) {
   }
 
   var payloadEnd = buf.length;
-  if (padding && buf.length > headerLen) payloadEnd -= buf[buf.length - 1];
+  if (padding && buf.length > headerLen) {
+    var padLen = buf[buf.length - 1];
+    // RFC 3550 §5.1: the pad count includes the count octet itself, so a
+    // valid P-flagged packet has padLen >= 1 and headerLen + padLen <=
+    // buf.length (equality = padding-only packet, empty payload). A pad
+    // count outside that range is a malformed/hostile packet — ignore
+    // the padding claim rather than let payloadEnd go below headerLen
+    // and silently swallow media bytes.
+    if (padLen >= 1 && headerLen + padLen <= buf.length) payloadEnd -= padLen;
+  }
 
   return {
     version: version, padding: padding, extension: extension,
@@ -429,6 +438,59 @@ function initDepacketizer(self, opts) {
   }
   self._output = opts.output;
   self._error = (typeof opts.error === 'function') ? opts.error : null;
+}
+
+/**
+ * Shared entry validation for every codec's depacketize().
+ *
+ * Distinguishes two cases that previous per-codec checks conflated:
+ *
+ *   1. MISSING payload (no packet object, or no .payload field) — a caller
+ *      bug: something that isn't a parse()-shaped packet was passed in.
+ *      → reported via emitError, depacketize() must return.
+ *
+ *   2. EMPTY payload (payload.length below the codec's minimum, including
+ *      zero) — VALID RTP, not an error. Padding-only packets (P bit set,
+ *      no media) are what libwebrtc/Chrome send for bandwidth probing
+ *      during BWE ramp-up and to sustain a minimum send rate; parse()
+ *      strips the padding, leaving payload.length === 0. RTX wraps of
+ *      such probes unwrap the same way (parseRtxPacket yields a zero-
+ *      length payload). These packets legitimately occupy sequence
+ *      numbers — they must flow through a JitterBuffer so gap detection
+ *      and NACK stay correct — but they carry nothing to reassemble.
+ *      → silently ignored, depacketize() must return.
+ *
+ * @param {object} self      the depacketizer (for emitError)
+ * @param {object} packet    the argument passed to depacketize()
+ * @param {number} minLen    codec's minimum meaningful payload length
+ *                           (1 for most codecs; 2 for H265's NAL header,
+ *                           AAC's AU-headers-length prefix, etc.)
+ * @returns {boolean} true if depacketize() should proceed, false if it
+ *                    must return immediately (error already reported
+ *                    for case 1; silence for case 2)
+ */
+function checkDepacketizePayload(self, packet, minLen) {
+  // Use-after-close guard. close() nulls _output; a depacketize() that
+  // arrives afterwards (typical source: a JitterBuffer flush timer that
+  // fires after the consumer tore down) used to crash on
+  // `this._output is not a function`. A closed depacketizer silently
+  // ignores input — matching WebCodecs, where a closed codec rejects
+  // work without throwing synchronously into the caller.
+  if (!self._output) return false;
+  if (!packet || !packet.payload) {
+    emitError(self, new Error(self.constructor.name + ': missing payload'));
+    return false;
+  }
+  if (packet.payload.length < minLen) {
+    // Zero-length: padding-only probe — valid, nothing to do.
+    // Between zero and minLen: technically a runt for this codec, but
+    // it still can't be distinguished from probe traffic reliably and
+    // carries nothing recoverable — skipping silently avoids log spam
+    // on networks that pad or trim unusually. Frame-level corruption
+    // is still caught downstream by the descriptor/NAL parsing.
+    return false;
+  }
+  return true;
 }
 
 /**
@@ -704,7 +766,7 @@ function setHeaderExtensions(rtpPacket, extsMap) {
 export {
   serialize, parse, RTP_HEADER_SIZE, RTP_VERSION, DEFAULT_MTU,
   initPacketizer, makePacket, makePacketWithPrefix, validateChunk, usToRtp,
-  initDepacketizer, emitError,
+  initDepacketizer, emitError, checkDepacketizePayload,
   parseExtensions, writeExtensions, setHeaderExtension, setHeaderExtensions,
   PROFILE_ONE_BYTE,
   absSendTime, transportCC, audioLevel, readAbsSendTime, readAudioLevel,
