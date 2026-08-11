@@ -18,8 +18,9 @@
 import {
   serialize, parse,
   RTP_HEADER_SIZE, DEFAULT_MTU,
-  parseExtensions, writeExtensions, setHeaderExtension, setHeaderExtensions,
-  absSendTime, transportCC, audioLevel, readAbsSendTime, readAudioLevel,
+  parseExtensions, readExtension, remapExtensionIds, writeExtensions, setHeaderExtension, setHeaderExtensions,
+  absSendTime, transportCC, audioLevel,
+  readAbsSendTime, readAudioLevel, readVideoOrientation, payloadOffset,
 } from './src/rtp.js';
 
 import { H264Packetizer, H264Depacketizer } from './src/h264.js';
@@ -227,8 +228,9 @@ export {
   generateSDP,
 
   // ── Header extensions (RFC 5285) ──
-  parseExtensions, writeExtensions, setHeaderExtension, setHeaderExtensions,
-  absSendTime, transportCC, audioLevel, readAbsSendTime, readAudioLevel,
+  parseExtensions, readExtension, remapExtensionIds, writeExtensions, setHeaderExtension, setHeaderExtensions,
+  absSendTime, transportCC, audioLevel,
+  readAbsSendTime, readAudioLevel, readVideoOrientation, payloadOffset,
 
   // ── SRTP profile name constants ──
   PROFILE_CM, PROFILE_GCM, PROFILE_GCM_256,
@@ -258,8 +260,9 @@ export default {
   buildSR, buildRR, buildPLI, buildNACK, buildFIR, buildREMB, buildTransportCC,
   buildSDES, buildBYE, buildCompound, parseRTCP, parseRTCPCompound,
   generateSDP,
-  parseExtensions, writeExtensions, setHeaderExtension, setHeaderExtensions,
-  absSendTime, transportCC, audioLevel, readAbsSendTime, readAudioLevel,
+  parseExtensions, readExtension, remapExtensionIds, writeExtensions, setHeaderExtension, setHeaderExtensions,
+  absSendTime, transportCC, audioLevel,
+  readAbsSendTime, readAudioLevel, readVideoOrientation, payloadOffset,
   PROFILE_CM, PROFILE_GCM, PROFILE_GCM_256,
   DtmfPacketizer, DTMFPacketizer, DTMFDepacketizer, parseDtmf,
 };

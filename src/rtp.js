@@ -132,6 +132,39 @@ function serialize(pkt) {
  * `extensions` is a map { id: Buffer } of one-byte RFC 5285 extensions
  * parsed from the extension block, or null if no extension block is present.
  */
+/**
+ * payloadOffset — where does the payload begin?
+ *
+ * The same computation parse() performs (fixed header + CSRCs + any
+ * RFC 5285 extension block), exposed on its own and extracted rather
+ * than copied: a forwarder on the packet path needs the number and
+ * nothing else, and parse() allocates an object plus a payload
+ * subarray to give it.
+ *
+ * Returns -1 for input that is not a parseable RTP packet, matching
+ * parse()'s "null on malformed" convention in spirit — a number-typed
+ * function cannot return null usefully.
+ *
+ * @param {Buffer|Uint8Array} buf — full RTP packet
+ * @returns {number} byte offset of the payload, or -1
+ */
+function payloadOffset(buf) {
+  if (!buf || buf.length < RTP_HEADER_SIZE) return -1;
+  if (((buf[0] >> 6) & 0x03) !== RTP_VERSION) return -1;
+  var headerLen = RTP_HEADER_SIZE + ((buf[0] & 0x0F) * 4);
+  if (buf.length < headerLen) return -1;
+  // Deliberately as TOLERANT as parse(): an X bit with a truncated
+  // extension block leaves the offset at the end of the fixed header
+  // rather than failing. Two functions that answer "where does the
+  // payload start" must not disagree at the edges — that divergence is
+  // the whole reason this is extracted instead of copied.
+  if (((buf[0] >> 4) & 1) && buf.length >= headerLen + 4) {
+    var extEnd = headerLen + 4 + (buf.readUInt16BE(headerLen + 2) * 4);
+    headerLen = extEnd <= buf.length ? extEnd : buf.length;   // same clamp as parse()
+  }
+  return headerLen;
+}
+
 function parse(buf) {
   if (!buf || buf.length < RTP_HEADER_SIZE) return null;
   var b0 = buf[0], b1 = buf[1];
@@ -166,7 +199,14 @@ function parse(buf) {
     if (profile === 0xBEDE && extDataEnd <= buf.length) {
       extensions = parseExtensions(buf.subarray(extDataStart, extDataEnd));
     }
-    headerLen = extDataEnd;
+    // A hostile or corrupt extension length used to be trusted here, so
+    // headerLength could point PAST the end of the packet (seen: 142908
+    // on a 36-byte buffer). The payload came out empty either way —
+    // subarray clamps — but the reported header length was fiction, and
+    // any consumer computing "payload starts at headerLength" from it
+    // was reading a number that could not be true. Clamp it: the header
+    // cannot be longer than the packet.
+    headerLen = extDataEnd <= buf.length ? extDataEnd : buf.length;
   }
 
   var payloadEnd = buf.length;
@@ -515,6 +555,88 @@ function emitError(self, err) {
 //  Header Extensions (RFC 5285)
 // ═══════════════════════════════════════════════════════════════════
 
+/**
+ * readExtension — the value of ONE header extension, without allocating.
+ *
+ * `parse()` gives you every extension as a map of subarrays, which is
+ * the right shape when you want them all. A forwarder usually wants one
+ * (the mid, or CVO, or audio level) and runs per packet, where building
+ * a map and N subarrays for a single lookup is the whole cost.
+ *
+ * Takes the FULL packet (not the extension block) so the caller does not
+ * have to locate the block first, and returns a subarray into it — no
+ * copy. Returns null when the packet has no extension block, is not in
+ * the one-byte (0xBEDE) form, or does not carry that id.
+ *
+ * @param {Buffer|Uint8Array} buf — full RTP packet
+ * @param {number} id — extension id, 1..14
+ * @returns {Buffer|null} the value bytes, or null
+ */
+function readExtension(buf, id) {
+  if (!buf || buf.length < RTP_HEADER_SIZE) return null;
+  if (!((buf[0] >> 4) & 1)) return null;                 // no X bit
+  var start = RTP_HEADER_SIZE + ((buf[0] & 0x0F) * 4);
+  if (start + 4 > buf.length) return null;
+  if (buf.readUInt16BE(start) !== 0xBEDE) return null;   // one-byte form only
+  var end = start + 4 + (buf.readUInt16BE(start + 2) * 4);
+  if (end > buf.length) end = buf.length;
+  var i = start + 4;
+  while (i < end) {
+    var b = buf[i];
+    if (b === 0) { i++; continue; }                      // padding
+    var eid = (b >> 4) & 0x0F;
+    var len = (b & 0x0F) + 1;
+    i++;
+    if (eid === 15) break;                               // reserved terminator
+    if (i + len > end) break;                            // truncated
+    if (eid === id) return buf.subarray(i, i + len);
+    i += len;
+  }
+  return null;
+}
+
+/**
+ * remapExtensionIds — rewrite one-byte extension IDs IN PLACE.
+ *
+ * An SFU bridges two id namespaces: the ids it negotiated with the
+ * sender are not the ids it negotiated with each receiver, and the
+ * mid/audio-level/CVO extensions it forwards must arrive under the
+ * receiver's numbering or be silently ignored. Rewriting is a
+ * four-bit edit per extension, so it is done in place — allocating a
+ * new packet per consumer per packet is the cost this avoids.
+ *
+ * Extensions absent from `idMap` are ZEROED (turned into padding)
+ * rather than passed through: an id that means one thing to us and
+ * another to the receiver is worse than no extension at all.
+ *
+ * @param {Buffer} buf — full RTP packet, modified in place
+ * @param {object} idMap — { ourId: theirId }
+ * @returns {number} payload offset (as payloadOffset would report), or -1
+ */
+function remapExtensionIds(buf, idMap) {
+  var start = payloadOffset(buf);
+  if (start < 0) return -1;
+  if (!idMap || !((buf[0] >> 4) & 1)) return start;
+  var blockStart = RTP_HEADER_SIZE + ((buf[0] & 0x0F) * 4);
+  if (blockStart + 4 > buf.length) return start;
+  if (buf.readUInt16BE(blockStart) !== 0xBEDE) return start;  // one-byte form only
+  var end = Math.min(blockStart + 4 + (buf.readUInt16BE(blockStart + 2) * 4), buf.length);
+  var i = blockStart + 4;
+  while (i < end) {
+    var b = buf[i];
+    if (b === 0) { i++; continue; }                           // padding
+    var len = (b & 0x0F) + 1;
+    var mapped = idMap[(b >> 4) & 0x0F];
+    if (mapped != null) {
+      buf[i] = ((mapped & 0x0F) << 4) | (b & 0x0F);
+    } else {
+      for (var z = i; z < i + 1 + len && z < end; z++) buf[z] = 0;
+    }
+    i += 1 + len;
+  }
+  return start;
+}
+
 function parseExtensions(extData) {
   var exts = {};
   var i = 0;
@@ -632,6 +754,34 @@ function readAudioLevel(data) {
   return {
     level: data[0] & 0x7F,
     voice: !!(data[0] & 0x80),
+  };
+}
+
+/**
+ * Read the CVO (Coordination of Video Orientation) extension byte,
+ * urn:3gpp:video-orientation — 3GPP TS 26.114 §6.2.3.
+ *
+ * The sender stamps one byte describing how the camera was held, so a
+ * receiver can rotate the picture instead of the encoder re-encoding it:
+ *
+ *     0 0 0 0 C F R1 R0
+ *             │ │ └──┴── rotation: 0°, 90°, 180°, 270° (counter-clockwise)
+ *             │ └─────── flip:   horizontal mirror (front camera)
+ *             └───────── camera: back (0) / front (1)
+ *
+ * Same shape as readAudioLevel: one byte in, a plain object or null
+ * out, never throws.
+ *
+ * @param {Buffer|Uint8Array} data — extension payload, exactly 1 byte
+ * @returns {{camera:boolean, flip:boolean, rotation:number}|null}
+ */
+function readVideoOrientation(data) {
+  if (!data || data.length < 1) return null;
+  var b = data[0];
+  return {
+    camera:   !!(b & 0x08),
+    flip:     !!(b & 0x04),
+    rotation: [0, 90, 180, 270][b & 0x03],
   };
 }
 
@@ -767,8 +917,10 @@ export {
   serialize, parse, RTP_HEADER_SIZE, RTP_VERSION, DEFAULT_MTU,
   initPacketizer, makePacket, makePacketWithPrefix, validateChunk, usToRtp,
   initDepacketizer, emitError, checkDepacketizePayload,
-  parseExtensions, writeExtensions, setHeaderExtension, setHeaderExtensions,
+  parseExtensions, readExtension, remapExtensionIds, writeExtensions, setHeaderExtension, setHeaderExtensions,
   PROFILE_ONE_BYTE,
-  absSendTime, transportCC, audioLevel, readAbsSendTime, readAudioLevel,
+  absSendTime, transportCC, audioLevel,
+  readAbsSendTime, readAudioLevel, readVideoOrientation,
+  payloadOffset,
   _toBuffer,
 };

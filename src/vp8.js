@@ -152,9 +152,76 @@ function _packetize(self, chunk, withMeta) {
  * @param {function} opts.output  called with { data, timestamp, type }
  * @param {function} [opts.error] called with Error on malformed input
  */
+
+/* ═══════════════════════════════════════════════════════════════════
+ *  VP8 payload descriptor (RFC 7741 §4.2)
+ * ═══════════════════════════════════════════════════════════════════
+ *
+ * ONE walk, three callers. peekKeyframe and depacketize each used to
+ * step through the descriptor themselves — the same bytes, the same
+ * bit tests, the same bounds checks, written twice (peekKeyframe's own
+ * comment said "walk it the same way depacketize() does"). Every fix
+ * had to land in both, and peekTemporalId would have made it three.
+ *
+ * NO ALLOCATION. The result is written into a caller-supplied object,
+ * because this runs per packet on the receive path: depacketize() keeps
+ * one on the instance, the statics share a module-level scratch. Both
+ * are safe — JavaScript is single-threaded here and no caller holds the
+ * result across a yield.
+ *
+ * Fields written to `out`:
+ *   ok       — false when the payload is too short / malformed
+ *   hdrLen   — bytes of descriptor; the bitstream starts here
+ *   start    — S bit: this packet starts a partition
+ *   tid      — temporal layer id, or null when the packet carries none
+ *   keyIdx   — key index, or null
+ */
+function readDescriptor(payload, out) {
+  out.ok = false;
+  out.hdrLen = 1;
+  out.start = false;
+  out.tid = null;
+  out.keyIdx = null;
+  if (!payload || payload.length < 1) return false;
+
+  out.start = !!(payload[0] & 0x10);
+
+  if (payload[0] & 0x80) {                 // X: extended descriptor
+    if (payload.length < 2) return false;
+    var ext = payload[1];
+    var i = 2;
+    if (ext & 0x80) {                      // I: PictureID present
+      // 16-bit PictureID when the first PID byte's M bit is set.
+      if (payload.length > 2 && (payload[2] & 0x80)) i += 2;
+      else i += 1;
+    }
+    if (ext & 0x40) i++;                   // L: TL0PICIDX
+    // T and K share one byte, and it is present if EITHER is set —
+    // checking only T misses encoders that emit KEYIDX without TID.
+    if (ext & 0x30) {
+      if (payload.length > i) {
+        var b = payload[i];
+        if (ext & 0x20) out.tid = (b >> 6) & 0x03;
+        if (ext & 0x10) out.keyIdx = b & 0x1f;
+      }
+      i++;
+    }
+    out.hdrLen = i;
+  }
+
+  if (out.hdrLen >= payload.length) return false;
+  out.ok = true;
+  return true;
+}
+
+// Scratch for the statics. Never escapes: every use reads the fields
+// before returning, and nothing awaits in between.
+var _peekDesc = {};
+
 function VP8Depacketizer(opts) {
   initDepacketizer(this, opts);
   this._fragments = [];
+  this._desc = {};        // reused per packet — see readDescriptor
 }
 
 /**
@@ -179,72 +246,55 @@ function VP8Depacketizer(opts) {
  * @returns {boolean}
  */
 VP8Depacketizer.peekKeyframe = function (payload) {
-  if (!payload || payload.length < 1) return false;
-
-  // S bit (RFC 7741 §4.2 figure 1) — start of a partition. Only the
-  // first packet of a frame can declare keyframe-ness; continuation
-  // packets carry no frame_type info on their own.
-  if ((payload[0] & 0x10) === 0) return false;
-
-  // Skip the VP8 payload descriptor to reach the first byte of the
-  // VP8 bitstream. Length depends on the X bit + extension bits.
-  // Walk it the same way depacketize() does, but defensively — bail
-  // out (return false) on any short read rather than throwing.
-  var hdrLen = 1;
-  if (payload[0] & 0x80) {
-    if (payload.length < 2) return false;
-    var ext = payload[1];
-    hdrLen = 2;
-    if (ext & 0x80) hdrLen++;       // PictureID byte 1
-    if (ext & 0x40) hdrLen++;       // TL0PICIDX
-    // TID/Y/KEYIDX share one byte. Per RFC 7741 §4.2, the byte is
-    // present if EITHER T (0x20) or K (0x10) is set — checking only
-    // T misses encoders that emit KEYIDX without TID (rare but valid).
-    if (ext & 0x30) hdrLen++;       // TID/Y/KEYIDX (T or K bit)
-    // 16-bit PictureID — present when (ext & 0x80) AND (PID byte's
-    // top bit set). Mirrors the depacketize() walk; bounds-check first.
-    if ((ext & 0x80) && payload.length > 2 && (payload[2] & 0x80)) hdrLen++;
-  }
-  if (hdrLen >= payload.length) return false;
-
+  if (!readDescriptor(payload, _peekDesc)) return false;
+  if (!_peekDesc.start) return false;      // continuation carries no frame tag
   // Bit 0 of the VP8 frame tag byte: 0 = key frame, 1 = inter frame.
   // (RFC 6386 §9.1 "frame tag" — first byte of the VP8 frame.)
-  return (payload[hdrLen] & 0x01) === 0;
+  return (payload[_peekDesc.hdrLen] & 0x01) === 0;
 };
 
 /**
- * Feed a parsed RTP packet (from rtp.parse()).
- * When a full frame is assembled, output() is invoked with the chunk.
+ * peekTemporalId — which temporal layer does THIS packet belong to?
+ * Static, like peekKeyframe, and the same "one packet, no state" idea.
  *
- * @param {object} packet — { payload, marker, timestamp, ... }
+ * An SFU uses it to drop high temporal layers for a viewer on a weak
+ * link: the encoder guarantees that nothing at or below a layer
+ * references a higher one, so discarding a whole TID lowers frame rate
+ * without touching resolution and without needing a keyframe.
+ *
+ * Returns:
+ *   0..3  — the packet's temporal layer
+ *   null  — the descriptor carries no temporal information (no X bit,
+ *           or T clear). NULL IS NOT ZERO: a stream without temporal
+ *           structure must reach every consumer, so a forwarder must be
+ *           able to tell "layer 0" from "no layers at all".
+ *
+ * @param {Buffer} payload — RTP payload (no RTP header)
+ * @returns {number|null}
  */
+VP8Depacketizer.peekTemporalId = function (payload) {
+  // Deliberately NOT gated on readDescriptor's return value. That flag
+  // means "there is a bitstream byte after the descriptor", which is
+  // what peekKeyframe needs — the TID is already known by then, and a
+  // packet whose descriptor fills the payload still belongs to a
+  // temporal layer. Gating on it made a valid descriptor-only packet
+  // report "no temporal information", which a forwarder reads as
+  // "send to everyone".
+  readDescriptor(payload, _peekDesc);
+  return _peekDesc.tid;
+};
+
 VP8Depacketizer.prototype.depacketize = function (packet) {
   if (!checkDepacketizePayload(this, packet, 1)) return;
 
   var payload = packet.payload;
-  var S = !!(payload[0] & 0x10);
-  var X = !!(payload[0] & 0x80);
-
-  // VP8 payload descriptor header length (RFC 7741 §4.2)
-  var hdrLen = 1;
-  if (X && payload.length > 1) {
-    var ext = payload[1]; hdrLen = 2;
-    if (ext & 0x80) hdrLen++;  // PictureID
-    if (ext & 0x40) hdrLen++;  // TL0PICIDX
-    // TID/Y/KEYIDX share one byte; present if T (0x20) OR K (0x10) is set.
-    if (ext & 0x30) hdrLen++;  // TID/Y/KEYIDX
-    // 16-bit PictureID: the first PID byte sits at index 2 (right after
-    // the extension byte); its top bit (M) signals a second PID byte.
-    // Previous check compared hdrLen against payload.length, which is
-    // unrelated to whether index 2 is readable.
-    if ((ext & 0x80) && payload.length > 2 && (payload[2] & 0x80)) hdrLen++;
-  }
-  if (hdrLen >= payload.length) {
+  if (!readDescriptor(payload, this._desc)) {
     emitError(this, new Error('VP8Depacketizer: header larger than payload'));
     return;
   }
+  var S = this._desc.start;
 
-  var data = payload.subarray(hdrLen);
+  var data = payload.subarray(this._desc.hdrLen);
   if (S) this._fragments = [data];
   else this._fragments.push(data);
 

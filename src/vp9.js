@@ -155,8 +155,69 @@ function _packetize(self, chunk, withMeta) {
  * @param {function} opts.output  called with { data, timestamp, type }
  * @param {function} [opts.error]
  */
+
+/* ═══════════════════════════════════════════════════════════════════
+ *  VP9 payload descriptor (draft-ietf-payload-vp9 §4.2)
+ * ═══════════════════════════════════════════════════════════════════
+ *
+ * Same reasoning as VP8's readDescriptor: one walk, no allocation, and
+ * the result written into a caller-supplied object. peekKeyframe only
+ * needed the first byte, so it never walked — but peekTemporalId does,
+ * and adding a second walk here is exactly what this shape avoids.
+ *
+ * Fields written to `out`:
+ *   ok      — false when the payload is too short / malformed
+ *   hdrLen  — bytes of descriptor; the VP9 frame starts here
+ *   start   — B bit: this packet starts a frame
+ *   end     — E bit: this packet ends a frame
+ *   inter   — P bit: inter-picture predicted (a keyframe has P=0)
+ *   tid     — temporal layer id, or null when no layer indices present
+ *   sid     — spatial layer id, or null
+ */
+function readDescriptor(payload, out) {
+  out.ok = false;
+  out.hdrLen = 1;
+  out.start = false; out.end = false; out.inter = false;
+  out.tid = null; out.sid = null;
+  if (!payload || payload.length < 1) return false;
+
+  var desc = payload[0];
+  var I = !!(desc & 0x80);   // Picture ID present
+  var L = !!(desc & 0x20);   // Layer indices present
+  var F = !!(desc & 0x10);   // Flexible mode
+  out.inter = !!(desc & 0x40);
+  out.start = !!(desc & 0x08);
+  out.end   = !!(desc & 0x04);
+
+  var hdrLen = 1;
+  if (I) {
+    hdrLen += (hdrLen < payload.length && (payload[hdrLen] & 0x80)) ? 2 : 1;
+  }
+  if (L) {
+    // Layer indices byte: T (3 bits) | U | S (3 bits) | D
+    if (hdrLen < payload.length) {
+      var li = payload[hdrLen];
+      out.tid = (li >> 5) & 0x07;
+      out.sid = (li >> 1) & 0x07;
+    }
+    hdrLen++;
+  }
+  if (F && out.inter) {
+    while (hdrLen < payload.length && !(payload[hdrLen] & 0x01)) hdrLen++;
+    hdrLen++;
+  }
+
+  out.hdrLen = hdrLen;
+  if (hdrLen >= payload.length) return false;
+  out.ok = true;
+  return true;
+}
+
+var _peekDesc = {};
+
 function VP9Depacketizer(opts) {
   initDepacketizer(this, opts);
+  this._desc = {};        // reused per packet — see readDescriptor
   this._fragments = [];
 }
 
@@ -186,39 +247,40 @@ function VP9Depacketizer(opts) {
  * @returns {boolean}
  */
 VP9Depacketizer.peekKeyframe = function (payload) {
+  // Unchanged semantics: B (start of frame) set and P (inter-picture
+  // predicted) clear. Only the first byte matters, so a malformed tail
+  // must NOT change the answer — hence reading the bits directly rather
+  // than requiring a fully valid descriptor.
   if (!payload || payload.length < 1) return false;
   var desc = payload[0];
-  var B = !!(desc & 0x08);   // start of a frame
-  var P = !!(desc & 0x40);   // inter-picture predicted
-  return B && !P;
+  return !!(desc & 0x08) && !(desc & 0x40);
+};
+
+/**
+ * peekTemporalId — which temporal layer does THIS packet belong to?
+ *
+ * VP9 carries T in the layer-indices byte, which is present only when
+ * the L bit is set. Returns null when it is not: a stream with no
+ * temporal structure must reach every consumer, so "layer 0" and "no
+ * layers" cannot be the same answer.
+ *
+ * @param {Buffer} payload — RTP payload (no RTP header)
+ * @returns {number|null} 0..7, or null
+ */
+VP9Depacketizer.peekTemporalId = function (payload) {
+  readDescriptor(payload, _peekDesc);
+  return _peekDesc.tid;
 };
 
 VP9Depacketizer.prototype.depacketize = function (packet) {
   if (!checkDepacketizePayload(this, packet, 1)) return;
 
   var payload = packet.payload;
-  var desc = payload[0];
-  var I = !!(desc & 0x80);   // Picture ID present
-  var P = !!(desc & 0x40);   // Inter-picture predicted
-  var L = !!(desc & 0x20);   // Layer indices present
-  var F = !!(desc & 0x10);   // Flexible mode
-  var B = !!(desc & 0x08);   // Start of a frame
-  var E = !!(desc & 0x04);   // End of a frame
-
-  // Compute payload descriptor length (RFC draft §4.2)
-  var hdrLen = 1;
-  if (I) {
-    hdrLen += (hdrLen < payload.length && (payload[hdrLen] & 0x80)) ? 2 : 1;
-  }
-  if (L) hdrLen++;
-  if (F && P) {
-    while (hdrLen < payload.length && !(payload[hdrLen] & 0x01)) hdrLen++;
-    hdrLen++;
-  }
-  if (hdrLen >= payload.length) {
+  if (!readDescriptor(payload, this._desc)) {
     emitError(this, new Error('VP9Depacketizer: header larger than payload'));
     return;
   }
+  var B = this._desc.start, E = this._desc.end, hdrLen = this._desc.hdrLen;
 
   var data = payload.subarray(hdrLen);
   if (B) this._fragments = [data];

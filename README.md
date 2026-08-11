@@ -16,6 +16,8 @@ Works anywhere RTP is spoken: WebRTC, RTSP, SIP, WHIP/WHEP, plain RTP-over-UDP.
   - [RTP core](#rtp-core)
   - [Packetizers](#packetizers)
   - [Depacketizers](#depacketizers)
+  - [Inspecting a packet without decoding it](#inspecting-a-packet-without-decoding-it)
+  - [Reading header extensions](#reading-header-extensions)
   - [Stream forwarding (SFU rewriting)](#stream-forwarding-sfu-rewriting)
   - [Factory helpers](#factory-helpers)
   - [JitterBuffer](#jitterbuffer)
@@ -28,6 +30,7 @@ Works anywhere RTP is spoken: WebRTC, RTSP, SIP, WHIP/WHEP, plain RTP-over-UDP.
   - [Header extension stamping](#header-extension-stamping)
   - [SDP](#sdp)
   - [Header extensions (RFC 5285)](#header-extensions-rfc-5285)
+  - [Complete export reference](#complete-export-reference)
 - [Performance](#performance)
 - [Use cases](#use-cases)
 - [RFC compliance](#rfc-compliance)
@@ -41,7 +44,9 @@ Works anywhere RTP is spoken: WebRTC, RTSP, SIP, WHIP/WHEP, plain RTP-over-UDP.
 - **Video codecs** — H.264, H.265 (HEVC), VP8, VP9, AV1
 - **Audio codecs** — Opus, G.711 (μ-law/A-law), G.722, AAC (RFC 3640 AAC-hbr)
 - **DTMF** — RFC 4733 named telephony events
-- **RTP** — header serialize/parse, sequence/timestamp handling, RFC 5285 extensions, header stamping
+- **RTP** — header serialize/parse, sequence/timestamp handling, RFC 5285 extensions, header stamping, `payloadOffset` for allocation-free forwarding
+- **Packet inspection** — `peekKeyframe` / `peekTemporalId` on every depacketizer: read a packet's keyframe status and temporal layer without decoding, for SFUs and NACK generators
+- **Header extension readers** — audio level (RFC 6464), abs-send-time, video orientation (3GPP CVO)
 - **RTCP** — SR, RR, NACK, PLI, FIR, REMB, transport-cc, SDES, BYE, RTX, compound packets
 - **SRTP** — AES-128-CM (RFC 3711) and AEAD AES-128-GCM (RFC 7714), replay protection, ROC rollover recovery, RFC 5764 DTLS keying-material helpers
 - **Jitter buffer** — reordering and loss detection with configurable latency, RTT-aware loss declaration, auto-resync on stream jumps, bounded memory
@@ -507,8 +512,111 @@ if (nackGen.needKeyframe()) {                          // loss beyond RTX recove
 }
 ```
 
-To know whether an arriving packet starts a keyframe without decoding it, every depacketizer exposes a static `peekKeyframe(payload)` — e.g. `VP8Depacketizer.peekKeyframe(pkt.payload)`.
+### Inspecting a packet without decoding it
 
+An SFU forwards packets; it never decodes them. But it does have to *read*
+two things off the wire, and every depacketizer exposes both as statics —
+no instance, no state, one packet in:
+
+```js
+import { VP8Depacketizer, payloadOffset } from 'rtp-packet';
+
+const off     = payloadOffset(rtpPacket);              // 12 + CSRCs + extensions
+const payload = rtpPacket.subarray(off);
+
+VP8Depacketizer.peekKeyframe(payload);    // → boolean
+VP8Depacketizer.peekTemporalId(payload);  // → 0..3 | null
+```
+
+`peekTemporalId` exists only where the codec carries temporal layers
+(VP8 and VP9 today). Test for it rather than assuming — a codec that
+gains temporal signalling later can add the method without a breaking
+change:
+
+```js
+const peek = MyDepacketizer.peekTemporalId;
+const tid  = peek ? peek(payload) : null;   // null = no temporal structure
+```
+
+| depacketizer | `peekKeyframe` | `peekTemporalId` |
+| --- | --- | --- |
+| `VP8Depacketizer` | ✓ | ✓ (0–3) |
+| `VP9Depacketizer` | ✓ | ✓ (0–7) |
+| `H264Depacketizer` | ✓ (IDR only) | not defined |
+| `H265Depacketizer` | ✓ | not defined |
+| `AV1Depacketizer` | ✓ | not defined |
+| `OpusDepacketizer`, `G711Depacketizer`, `G722Depacketizer`, `AacDepacketizer`, `REDDepacketizer` | always `false` | not defined |
+
+**`peekKeyframe`** answers "does this packet start a decodable entry
+point". For H.264 that means an actual IDR — a parameter set (SPS/PPS)
+on its own decodes nothing, so it returns `false`. A forwarder that
+treats SPS as the anchor releases a viewer one packet too early.
+
+Audio codecs answer `false` unconditionally: every audio packet decodes
+on its own, so "keyframe" has no meaning there and a caller asking the
+question is asking about video. `peekTemporalId` is simply not defined
+on them — check for the method, or call it only for the codecs in the
+table above.
+
+**`peekTemporalId`** answers "which temporal layer is this packet in".
+Dropping every packet above a chosen TID lowers frame rate without
+touching resolution and without needing a keyframe — the gentle first
+move when a viewer's link degrades.
+
+`null` is not `0`. It means *this stream carries no temporal structure*,
+and such a stream must reach every consumer: a forwarder that treats
+`null` as layer 0 silences non-layered video the moment anything caps
+the temporal layer.
+
+Neither call allocates: both walk the descriptor once into a reused
+scratch object, so they are safe to call per packet (~68M calls/sec).
+
+
+### Reading header extensions
+
+The one-byte RFC 5285 extensions WebRTC actually uses have readers beside
+the writers:
+
+```js
+import { parse, readAudioLevel, readAbsSendTime, readVideoOrientation } from 'rtp-packet';
+
+const pkt = parse(buf);
+readAudioLevel(pkt.extensions[1]);        // → { level, voice }        RFC 6464
+readAbsSendTime(pkt.extensions[2]);       // → seconds                 abs-send-time
+readVideoOrientation(pkt.extensions[6]);  // → { camera, flip, rotation }  3GPP TS 26.114
+```
+
+Each returns `null` (or `0` for abs-send-time) on missing or short data
+rather than throwing — the same convention as `parse()`.
+
+When you want **one** extension and you are on the packet path, skip the
+map: `readExtension(buf, id)` takes the full packet and returns a view
+into it, with no allocation.
+
+```js
+import { readExtension, readVideoOrientation } from 'rtp-packet';
+
+const cvo = readVideoOrientation(readExtension(rtpPacket, 6));  // or null
+```
+
+An SFU bridging two id namespaces — the sender's numbering is not the
+receiver's — rewrites them in place, and gets the payload offset back:
+
+```js
+import { remapExtensionIds } from 'rtp-packet';
+
+const payloadStart = remapExtensionIds(pkt, { 4: 9 });  // our id 4 → their 9
+```
+
+Extensions with no entry in the map are zeroed rather than forwarded: an
+id that means one thing to you and another to the receiver is worse than
+no extension at all. The rule is uniform, so an **empty** map blanks
+every extension — pass no map (`null`) when you mean "leave them alone".
+
+`readVideoOrientation` gives back `rotation` in degrees (0/90/180/270),
+`flip` for the horizontal mirror a front camera applies, and `camera`
+for front vs back. Only the *changes* usually matter: that is what lets
+a UI rotate a `<video>` instead of an encoder re-encoding the picture.
 
 ### RED — redundant audio (RFC 2198)
 
@@ -731,6 +839,40 @@ Semantics (the delta-preserving model):
   the timestamp advances by your estimate of elapsed media time.
 - Input sequence/timestamp wraparound is transparent.
 
+### Complete export reference
+
+Every name the package exports, in one place — so the surface is
+discoverable without reading `index.js`.
+
+**Packetizers / depacketizers** — `VP8`, `VP9`, `H264`, `H265`, `AV1`,
+`Opus`, `Aac`, `G711`, `G722`, `RED`, `DTMF`, each as `XPacketizer` and
+`XDepacketizer` (`AacDepacketizer`, `G711Depacketizer`,
+`G722Depacketizer` and `DtmfPacketizer` included). Every depacketizer
+carries the `peekKeyframe` and `peekTemporalId` statics from the table
+above.
+
+**Packet layer** — `parse`, `serialize`, `payloadOffset`,
+`parseExtensions`, `readExtension`, `remapExtensionIds`,
+`setHeaderExtension`, `setHeaderExtensions`,
+`RTP_HEADER_SIZE`, `RTP_VERSION`, `DEFAULT_MTU`.
+
+**Header extensions** — writers `absSendTime`, `transportCC`,
+`audioLevel`; readers `readAbsSendTime`, `readAudioLevel`,
+`readVideoOrientation`; `RtpHeaderStamper` to apply them on send.
+
+**RTCP** — `parseRTCP`, `parseRTCPCompound`, `parseREMB`,
+`parseTransportCC`, and builders `buildSR`, `buildRR`, `buildSDES`,
+`buildBYE`, `buildNACK`, `buildPLI`, `buildFIR`, `buildREMB`,
+`buildTransportCC`, `buildCompound`.
+
+**Loss recovery** — `SenderBuffer`, `RtxStream`, `NackThrottle`,
+`NackGenerator`, `buildRtxPacket`, `parseRtxPacket`, `Histogram`;
+`FlexFecEncoder` / `FlexFecDecoder` for FEC.
+
+**Transport** — `SrtpSession` (`PROFILE_CM`, `PROFILE_GCM`,
+`PROFILE_GCM_256`, `AUTH_TAG_LEN`, `GCM_TAG_LEN`), `JitterBuffer`,
+`RtpForwarder`, `generateSDP`, `parseDtmf`.
+
 ## Performance
 
 Measured on Node.js 22, single thread:
@@ -848,6 +990,61 @@ This keeps rtp-packet at ~5000 lines and minimal dependencies, while letting it 
 
 
 ## Changelog
+
+### 0.6.0
+
+**Packet inspection without decoding**
+
+- `VP8Depacketizer.peekTemporalId(payload)` / `VP9Depacketizer.peekTemporalId(payload)`
+  — the packet's temporal layer, or `null` when the stream carries no
+  temporal structure. An SFU drops packets above a chosen TID to lower
+  frame rate without touching resolution and without a keyframe.
+  `null` is deliberately distinct from `0`: a non-layered stream must
+  still reach consumers that cap the temporal layer.
+- `payloadOffset(buf)` — byte offset of the payload (fixed header +
+  CSRCs + extension block) with no allocation. `parse()` already
+  computed it but built an object and a payload subarray to hand it
+  over; forwarders on the packet path need only the number.
+- `readVideoOrientation(data)` — CVO extension (3GPP TS 26.114):
+  `{ camera, flip, rotation }`, beside `readAudioLevel` and
+  `readAbsSendTime`.
+- `remapExtensionIds(buf, idMap)` — rewrite one-byte extension ids in
+  place (the SFU case: the sender's numbering is not the receiver's),
+  returning the payload offset. Unmapped ids are zeroed.
+- `readExtension(buf, id)` — one header extension from a full packet, as
+  a view, without allocating. `parse()` builds a map of every extension,
+  which is the wrong shape when a forwarder wants a single id per
+  packet.
+
+These three (`payloadOffset`, `readExtension`, `remapExtensionIds`) came
+out of an SFU that had written all of them locally — the packet-format
+knowledge belongs here, next to the parser that already knew it.
+
+**Internal: one descriptor walk per codec**
+
+- `vp8.js` and `vp9.js` now parse their payload descriptor in a single
+  shared, allocation-free routine used by `peekKeyframe`,
+  `peekTemporalId` and `depacketize`. The walk previously existed twice
+  per codec (`peekKeyframe`'s own comment read "walk it the same way
+  depacketize() does"), so every fix — such as reading the TID/KEYIDX
+  byte when either T *or* K is set — had to be applied in both places.
+  Behaviour verified identical across 589,824 generated descriptor
+  shapes; throughput unchanged (~68M peek calls/sec, zero allocation).
+
+**Fixed**
+
+- `parse()` could report a `headerLength` past the end of the packet
+  when a corrupt extension length was present (observed: 142908 on a
+  36-byte buffer). The payload was empty either way, but the reported
+  length was unusable. Now clamped to the packet length, and
+  `payloadOffset()` clamps identically so the two can never disagree.
+
+**Docs**
+
+- Every exported symbol now appears in the README (was 14 undocumented,
+  including three whole depacketizers and `readAudioLevel`), with a
+  table showing that `peekKeyframe` exists on *every* depacketizer —
+  its absence had led a consumer to reimplement it per codec.
 
 ### 0.5.0
 
