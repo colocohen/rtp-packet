@@ -200,8 +200,7 @@ function SrtpSession(arg1, arg2, arg3) {
 
   // SRTCP has its own monotonically-increasing 31-bit index (not ssrc-keyed)
   this._srtcpSendIndex = 0;
-  this._srtcpSeenIndices = {};  // replay protection for SRTCP
-  this._srtcpSeenCount = 0;
+  this._srtcpRecvState = {};    // ssrc → { maxIndex, replay } — SRTCP replay window per SSRC
 
   // Scratch buffers reused across every encrypt/decrypt call — avoids
   // allocating an IV and a ROC buffer on every packet. Safe because
@@ -461,9 +460,8 @@ SrtpSession.prototype.decryptRtcp = function (srtcpPacket) {
   var expectedTag = hmac.digest().subarray(0, AUTH_TAG_LEN);
   if (!_constantTimeEquals(authTag, expectedTag)) return null;
 
-  if (!this._srtcpReplayOk(index)) return null;
-
   var ssrc = srtcpPacket.readUInt32BE(4);
+  if (!this._srtcpReplayOk(ssrc, index)) return null;
 
   if (!isEncrypted) {
     // E flag clear — packet was authenticated only, not encrypted
@@ -506,7 +504,7 @@ SrtpSession.prototype._decryptRtcpGcm = function (srtcpPacket) {
     decipher.setAuthTag(srtcpPacket.subarray(tagStart, indexStart));
     var pt = decipher.update(srtcpPacket.subarray(8, tagStart));
     decipher.final();   // throws on auth failure
-    if (!this._srtcpReplayOk(index)) return null;
+    if (!this._srtcpReplayOk(srtcpPacket.readUInt32BE(4), index)) return null;
     var out = Buffer.allocUnsafe(8 + pt.length);
     srtcpPacket.copy(out, 0, 0, 8);
     pt.copy(out, 8);
@@ -516,19 +514,22 @@ SrtpSession.prototype._decryptRtcpGcm = function (srtcpPacket) {
   }
 };
 
-/** SRTCP replay: reject seen indices; bounded memory. */
-SrtpSession.prototype._srtcpReplayOk = function (index) {
+/**
+ * SRTCP replay (RFC 3711 §3.3.2): the SRTCP index is counted per sending
+ * SSRC, so the window is too — the same 128-entry bitmap as SRTP.
+ *
+ * It used to be one set of indices for the whole session. A peer sending
+ * RTCP from more than one SSRC (a browser: one per audio and video sender,
+ * each counting from its own start) collided on every index, and all but the
+ * first SSRC's RTCP — reports, NACKs, PLIs, transport-cc feedback — was
+ * dropped as "replayed". And its evict-half-when-full step forgot indices,
+ * which then passed as new: replays of older packets were accepted.
+ */
+SrtpSession.prototype._srtcpReplayOk = function (ssrc, index) {
   if (!this._replayEnabled) return true;
-  if (this._srtcpSeenIndices[index]) return false;
-  this._srtcpSeenIndices[index] = true;
-  if (++this._srtcpSeenCount > 1024) {
-    // Evict oldest half
-    var seenKeys = Object.keys(this._srtcpSeenIndices);
-    seenKeys.sort(function (a, b) { return (+a) - (+b); });
-    for (var i = 0; i < 512; i++) delete this._srtcpSeenIndices[seenKeys[i]];
-    this._srtcpSeenCount = seenKeys.length - 512;
-  }
-  return true;
+  var st = this._srtcpRecvState[ssrc];
+  if (!st) st = this._srtcpRecvState[ssrc] = { maxIndex: -1, replay: new Uint32Array(4) };
+  return _replayCheckAndUpdate(st, index);
 };
 
 

@@ -101,6 +101,21 @@ SenderBuffer.prototype.store = function (rtpPacket) {
   };
 };
 
+/**
+ * storeOwned — like store(), but takes the packet as it is instead of a
+ * snapshot. For a caller that hands the buffer over and never modifies it
+ * afterwards (e.g. a packet it just built itself), saving one allocation
+ * and copy per packet.
+ */
+SenderBuffer.prototype.storeOwned = function (rtpPacket) {
+  if (!rtpPacket || rtpPacket.length < 12) return;
+  var ssrc = rtpPacket.readUInt32BE(8);
+  var seq  = rtpPacket.readUInt16BE(2);
+  var ring = this._rings[ssrc];
+  if (!ring) ring = this._rings[ssrc] = new Array(this._size);
+  ring[seq % this._size] = { seq: seq, packet: rtpPacket };
+};
+
 SenderBuffer.prototype.get = function (ssrc, seq) {
   var ring = this._rings[ssrc];
   if (!ring) return null;
@@ -745,15 +760,16 @@ NackGenerator.prototype._addKeyframe = function (extSeq) {
  * keyframe-based emergency eviction.
  */
 NackGenerator.prototype._evictMissingBelow = function (cutoff) {
-  // Map iteration order is insertion order, which is roughly seq order
-  // for normal traffic. We do a full scan rather than a sorted index
-  // because the eviction work is bounded (only happens at drain).
-  var toDelete = [];
-  this._missing.forEach(function (info, seq) {
-    if (seq < cutoff) toDelete.push(seq);
-  });
-  for (var i = 0; i < toDelete.length; i++) {
-    this._missing.delete(toDelete[i]);
+  // _missing is in ascending extSeq order: entries are only ever added by
+  // _addMissingRange, for seqs above the previous high-water mark, in
+  // increasing order (Map keeps insertion order; deletes don't reorder).
+  // So the entries to drop are a prefix — stop at the first one that stays.
+  // This runs on every packet (via _evictOld); scanning the whole map and
+  // collecting into an array each time cost O(size) per packet under loss.
+  if (this._missing.size === 0) return;
+  for (var seq of this._missing.keys()) {
+    if (seq >= cutoff) break;
+    this._missing.delete(seq);
   }
 };
 
@@ -767,8 +783,17 @@ NackGenerator.prototype._evictOld = function () {
   var cutoff = this._highestExtSeq - this._maxPacketAge;
   if (cutoff <= 0) return;
 
-  // _received: drop everything below cutoff.
-  flatRanges.remove(this._received, [-Infinity, cutoff]);
+  // _received: drop everything below cutoff. In place — sorted half-open
+  // ranges, so it is: drop the ranges that end at or before the cutoff,
+  // then clip the first one left. Per packet this is just raising
+  // _received[0] by one (flatRanges.remove rebuilt the array every time).
+  var r = this._received;
+  if (r.length > 0 && r[0] < cutoff) {
+    var k = 0;
+    while (k < r.length && r[k + 1] <= cutoff) k += 2;
+    if (k > 0) r.splice(0, k);
+    if (r.length > 0 && r[0] < cutoff) r[0] = cutoff;
+  }
 
   // _keyframes: drop everything below cutoff.
   var arr = this._keyframes;

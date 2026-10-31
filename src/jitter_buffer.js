@@ -253,6 +253,10 @@ JitterBuffer.prototype._forceAdvance = function () {
  * what makes gaps larger than the linear window recoverable at all.
  */
 JitterBuffer.prototype._findNextAvailable = function () {
+  // Empty buffer: nothing to find. Checked first because the flush timer
+  // calls this on every tick, and an idle stream otherwise probed 256
+  // slots each time.
+  if (this._count === 0) return null;
   var limit = Math.min(256, this._maxSize + 1);
   for (var i = 1; i <= limit; i++) {
     var seq = (this._nextSeq + i) & 0xFFFF;
