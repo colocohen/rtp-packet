@@ -429,7 +429,7 @@ const session = new SrtpSession({
 
 **Security features (both profiles):**
 
-- **Replay protection (RFC 3711 §3.3.2)** — a 128-packet sliding window per SSRC rejects replayed and too-old RTP packets; SRTCP has index-based replay tracking. On by default; pass `{ replayProtection: false }` to disable (e.g. when decrypting capture files offline, where re-processing the same packets is intentional).
+- **Replay protection (RFC 3711 §3.3.2)** — a 128-packet sliding window per SSRC rejects replayed and too-old RTP packets; SRTCP uses the same 128-entry window per SSRC (the SRTCP index is counted per sending SSRC, so a peer sending RTCP from several SSRCs — a browser with audio and video — is tracked per SSRC). On by default; pass `{ replayProtection: false }` to disable (e.g. when decrypting capture files offline, where re-processing the same packets is intentional).
 - **ROC index guessing (libsrtp-style)** — late packets that straddle a sequence-number rollover decrypt correctly with `roc − 1`; early post-wrap packets use `roc + 1`. Without this, one packet in every 65,536 window is silently lost — reliably, right when RTX retransmissions are in flight.
 - Send and receive state are tracked separately per SSRC, so symmetric-key sessions don't poison their own replay window.
 - Constant-time tag comparison (CM profile); AEAD tag verification (GCM).
@@ -474,7 +474,8 @@ const rtxStream = new RtxStream({
 const throttle = new NackThrottle({ windowMs: 100 });
 
 // On each outgoing packet (before SRTP):
-senderBuf.store(rtpPacket);          // keyed by (ssrc, seq) read from the packet
+senderBuf.store(rtpPacket);          // keyed by (ssrc, seq) read from the packet; keeps a snapshot
+senderBuf.storeOwned(rtpPacket);     // same, keeps the buffer itself — only for a buffer you never modify afterwards
 
 // On incoming NACK for mediaSsrc:
 parsedNack.lostSequenceNumbers.forEach((seq) => {
@@ -1002,6 +1003,7 @@ This keeps rtp-packet at ~5000 lines and minimal dependencies, while letting it 
   lengths must add up to the packet received) then fails, and a
   receiver that applies it drops the REMB. The length is now taken from
   the buffer the builder allocates, so the two can't disagree.
+  (Reported and fixed by @nitedani in #2.)
 
 ### 0.6.0
 

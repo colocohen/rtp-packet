@@ -1,6 +1,6 @@
 {
   "name": "rtp-packet",
-  "version": "0.1.0",
+  "version": "0.5.1",
   "description": "RTP/RTCP packetization for Node.js",
   "type": "module",
   "main": "index.js",
@@ -31,7 +31,12 @@
     "packetizer", "depacketizer", "rtx", "nack", "transport-cc"
   ],
   "dependencies": {
-    "flat-ranges": "^2.1.0",
-    "media-processing": "^0.2.0"
-  }
+    "flat-ranges": "^2.2.0"
+  },
+  "funding": [
+    {
+      "type": "github",
+      "url": "https://github.com/sponsors/colocohen"
+    }
+  ]
 }
