@@ -149,7 +149,7 @@ function buildREMB(senderSsrc, mediaSsrcs, bitrate) {
   var buf = Buffer.allocUnsafe(20 + numSsrcs * 4);
   buf[0] = 0x8F;  // V=2, P=0, FMT=15
   buf[1] = 206;   // PSFB
-  buf.writeUInt16BE((2 + 1 + numSsrcs), 2);  // length
+  buf.writeUInt16BE((buf.length >> 2) - 1, 2);  // length in 32-bit words minus 1
   buf.writeUInt32BE(senderSsrc >>> 0, 4);
   buf.writeUInt32BE(0, 8);  // media SSRC = 0
 

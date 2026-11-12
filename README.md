@@ -991,6 +991,18 @@ This keeps rtp-packet at ~5000 lines and minimal dependencies, while letting it 
 
 ## Changelog
 
+### Unreleased
+
+**Fixed**
+
+- `buildREMB()` wrote the RTCP length field one word short: a 24-byte
+  REMB with one SSRC said 20 bytes. A receiver walking a compound packet
+  by its length fields read the last SSRC as the next packet's header.
+  Depending on that SSRC's bytes, RFC 3550's validity check (§A.2: the
+  lengths must add up to the packet received) then fails, and a
+  receiver that applies it drops the REMB. The length is now taken from
+  the buffer the builder allocates, so the two can't disagree.
+
 ### 0.6.0
 
 **Packet inspection without decoding**
