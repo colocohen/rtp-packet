@@ -237,6 +237,11 @@ JitterBuffer.prototype._declareGapAndSkip = function (gapEnd) {
  * unconditionally so memory stays bounded.
  */
 JitterBuffer.prototype._forceAdvance = function () {
+  // The head itself is buffered (pushes outran the flush timer, no gap):
+  // _findEarliest would return _nextSeq (distance 0) and the skip below
+  // would be a no-op, so drain directly instead of walking every key —
+  // that walk ran on each push while the buffer sat at capacity.
+  if (this._buffer[this._nextSeq] !== undefined) { this._flush(); return; }
   var earliest = this._findEarliest();
   if (earliest === null) return;
   this._declareGapAndSkip(earliest);

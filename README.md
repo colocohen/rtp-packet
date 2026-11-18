@@ -55,7 +55,7 @@ Works anywhere RTP is spoken: WebRTC, RTSP, SIP, WHIP/WHEP, plain RTP-over-UDP.
 - **FlexFEC** — forward error correction (flexfec-03, the variant libwebrtc ships): XOR repair packets for video
 - **Bandwidth estimation** — transport-cc and REMB feedback parsing + delay-based estimator
 - **SDP** — session description generator covering all supported codecs
-- **Pure JavaScript** — no native bindings, just two small pure-JS dependencies
+- **Pure JavaScript** — no native bindings, just small pure-JS dependencies; SRTP's AES and HMAC-SHA1 come from [`cryptographic-primitives`](https://github.com/colocohen/cryptographic-primitives), which runs them on Node's OpenSSL
 - **Fast** — ~400K packets/sec on a single thread
 
 ## Install

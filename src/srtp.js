@@ -45,7 +45,10 @@
  *   session.protectRtp / unprotectRtp / protectRtcp / unprotectRtcp
  */
 
-import crypto from 'node:crypto';
+// Crypto from cryptographic-primitives, which picks native or pure JavaScript
+import { aes_gcm_create, aes_ctr_sync } from 'cryptographic-primitives/aes.js';
+import { hmac_sync } from 'cryptographic-primitives/hmac.js';
+import { sha1_sync } from 'cryptographic-primitives/sha1.js';
 
 
 // ═══════════════════════════════════════════════════════════════════
@@ -151,7 +154,6 @@ function SrtpSession(arg1, arg2, arg3) {
   // KDF runs AES-256-CTR keyed by the 32-byte master key. Everything
   // else (12-byte salt, 16-byte tag, IV formation) is identical to 128.
   this._keyLen = (profile === PROFILE_GCM_256) ? 32 : SESSION_KEY_LEN;
-  this._gcmCipher = (profile === PROFILE_GCM_256) ? 'aes-256-gcm' : 'aes-128-gcm';
   this._tagLen = this._gcm ? GCM_TAG_LEN : AUTH_TAG_LEN;
   this._replayEnabled = !(opts && opts.replayProtection === false);
 
@@ -180,7 +182,13 @@ function SrtpSession(arg1, arg2, arg3) {
   this._decRtcpKey  = _deriveKey(decMasterKey, decKdfSalt, LABEL_RTCP_CIPHER, this._keyLen);
   this._decRtcpSalt = _deriveKey(decMasterKey, decKdfSalt, LABEL_RTCP_SALT,   saltLen);
 
-  if (!this._gcm) {
+  if (this._gcm) {
+    // One keyed AES-GCM context per session key, made once
+    this._encRtpGcm  = aes_gcm_create(this._encRtpKey);
+    this._decRtpGcm  = aes_gcm_create(this._decRtpKey);
+    this._encRtcpGcm = aes_gcm_create(this._encRtcpKey);
+    this._decRtcpGcm = aes_gcm_create(this._decRtcpKey);
+  } else {
     // Auth keys only exist in the CM profile — GCM is AEAD.
     this._encRtpAuth  = _deriveKey(encMasterKey, encKdfSalt, LABEL_RTP_AUTH,  AUTH_KEY_LEN);
     this._encRtcpAuth = _deriveKey(encMasterKey, encKdfSalt, LABEL_RTCP_AUTH, AUTH_KEY_LEN);
@@ -203,12 +211,20 @@ function SrtpSession(arg1, arg2, arg3) {
   this._srtcpRecvState = {};    // ssrc → { maxIndex, replay } — SRTCP replay window per SSRC
 
   // Scratch buffers reused across every encrypt/decrypt call — avoids
-  // allocating an IV and a ROC buffer on every packet. Safe because
+  // allocating them on every packet. Safe because
   // we're single-threaded and each method finishes with the scratch
   // before returning.
-  this._ivScratch = Buffer.allocUnsafe(16);   // CM uses 16; GCM uses first 12
-  this._rocScratch = Buffer.allocUnsafe(4);
-  this._aadScratch = Buffer.allocUnsafe(12);  // SRTCP GCM AAD: header(8) + index(4)
+  //
+  // ⚠ WHAT GOES TO cryptographic-primitives IS A PLAIN Uint8Array, made
+  //   once: the library turns every Buffer argument into a new Uint8Array
+  //   over the same bytes, and each Buffer subarray() is an object of its
+  //   own. Per packet those views were most of the garbage the young-generation
+  //   GC collected (measured: ~1.2 KB a packet, about 0.6 µs of GC).
+  this._ivScratch = new Uint8Array(16);         // CM uses 16; GCM uses first 12
+  this._iv12 = this._ivScratch.subarray(0, 12);
+  this._macScratch = null;                      // CM receive: authenticated || ROC, grown as needed
+  this._aadScratch = Buffer.allocUnsafe(12);   // SRTCP GCM AAD: header(8) + index(4)
+  this._aadView = _view(this._aadScratch, 0, 12);
 }
 
 
@@ -246,40 +262,31 @@ SrtpSession.prototype.encryptRtp = function (rtpPacket) {
 
   var headerLen = _rtpHeaderLength(rtpPacket);
   if (headerLen > rtpPacket.length) return null;
-  var payload = rtpPacket.subarray(headerLen);
+  var len = rtpPacket.length;
 
   if (this._gcm) {
-    // ── RFC 7714 §8: AES-GCM ──
+    // ── RFC 7714 §8: AES-GCM ── the packet sealed into its output, which
+    // holds the header (the AAD) first
     _buildGcmRtpIv(this._ivScratch, this._encRtpSalt, ssrc, roc, seq);
-    var iv = this._ivScratch.subarray(0, 12);
-    var cipher = crypto.createCipheriv(this._gcmCipher, this._encRtpKey, iv, { authTagLength: GCM_TAG_LEN });
-    cipher.setAAD(rtpPacket.subarray(0, headerLen));
-    var ct = cipher.update(payload);
-    cipher.final();
-    var tag = cipher.getAuthTag();
-
-    var outG = Buffer.allocUnsafe(rtpPacket.length + GCM_TAG_LEN);
-    rtpPacket.copy(outG, 0, 0, headerLen);
-    ct.copy(outG, headerLen);
-    tag.copy(outG, headerLen + ct.length);
+    var outG = Buffer.allocUnsafe(len + GCM_TAG_LEN);
+    rtpPacket.copy(outG, 0, 0, len);
+    this._encRtpGcm.encrypt_into_sync(outG, headerLen, this._iv12, _view(outG, headerLen, len), _view(outG, 0, headerLen));
     return outG;
   }
 
   // ── RFC 3711: AES-128-CM + HMAC-SHA1-80 ──
   _buildRtpIv(this._ivScratch, this._encRtpSalt, ssrc, index);
-  var encPayload = _aesCmEncrypt(this._encRtpKey, this._ivScratch, payload);
+  var encPayload = _aesCmEncrypt(this._encRtpKey, this._ivScratch, _view(rtpPacket, headerLen, len));
 
   // Assemble output: header (clear) | encrypted payload | auth tag
-  var out = Buffer.allocUnsafe(rtpPacket.length + AUTH_TAG_LEN);
+  var out = Buffer.allocUnsafe(len + AUTH_TAG_LEN);
   rtpPacket.copy(out, 0, 0, headerLen);
-  encPayload.copy(out, headerLen);
+  out.set(encPayload, headerLen);
 
-  // HMAC-SHA1 over (header + encrypted || ROC). Reuse ROC scratch buffer.
-  this._rocScratch.writeUInt32BE(roc >>> 0, 0);
-  var hmac = crypto.createHmac('sha1', this._encRtpAuth);
-  hmac.update(out.subarray(0, rtpPacket.length));
-  hmac.update(this._rocScratch);
-  hmac.digest().copy(out, rtpPacket.length, 0, AUTH_TAG_LEN);
+  // HMAC-SHA1 over (header + encrypted || ROC): the ROC goes where the tag
+  // will be, and the tag overwrites it
+  out.writeUInt32BE(roc >>> 0, len);
+  _copyTag(hmac_sync(sha1_sync, this._encRtpAuth, _view(out, 0, len + 4)), out, len);
 
   return out;
 };
@@ -327,39 +334,32 @@ SrtpSession.prototype.decryptRtp = function (srtpPacket) {
     if (tagStart < ctStart) return null;
 
     _buildGcmRtpIv(this._ivScratch, this._decRtpSalt, ssrc, guessRoc, seq);
-    var iv = this._ivScratch.subarray(0, 12);
-    try {
-      var decipher = crypto.createDecipheriv(this._gcmCipher, this._decRtpKey, iv, { authTagLength: GCM_TAG_LEN });
-      decipher.setAAD(srtpPacket.subarray(0, headerLen));
-      decipher.setAuthTag(srtpPacket.subarray(tagStart));
-      var pt = decipher.update(srtpPacket.subarray(ctStart, tagStart));
-      decipher.final();   // throws on auth failure
-      plaintext = Buffer.allocUnsafe(headerLen + pt.length);
-      srtpPacket.copy(plaintext, 0, 0, headerLen);
-      pt.copy(plaintext, headerLen);
-    } catch (e) {
-      return null;
-    }
+    plaintext = Buffer.allocUnsafe(tagStart);
+    // null when the tag does not verify
+    if (this._decRtpGcm.decrypt_into_sync(plaintext, headerLen, this._iv12, _view(srtpPacket, ctStart, srtpPacket.length),
+                                          _view(srtpPacket, 0, headerLen)) === null) return null;
+    srtpPacket.copy(plaintext, 0, 0, headerLen);
   } else {
     // ── RFC 3711: verify HMAC, then AES-CM decrypt ──
     var authTagStart = srtpPacket.length - AUTH_TAG_LEN;
-    var authenticated = srtpPacket.subarray(0, authTagStart);
-    var authTag = srtpPacket.subarray(authTagStart);
 
-    this._rocScratch.writeUInt32BE(guessRoc >>> 0, 0);
-    var hmac = crypto.createHmac('sha1', this._decRtpAuth);
-    hmac.update(authenticated);
-    hmac.update(this._rocScratch);
-    var expectedTag = hmac.digest().subarray(0, AUTH_TAG_LEN);
-    if (!_constantTimeEquals(authTag, expectedTag)) return null;
+    // HMAC-SHA1 over (authenticated || ROC), assembled in a reused buffer
+    var macIn = this._macScratch;
+    if (!macIn || macIn.length < authTagStart + 4) {
+      macIn = this._macScratch = Buffer.allocUnsafe(Math.max(authTagStart + 4, 1500));
+      this._macView = _view(macIn, 0, macIn.length);
+    }
+    srtpPacket.copy(macIn, 0, 0, authTagStart);
+    macIn.writeUInt32BE(guessRoc >>> 0, authTagStart);
+    var mac = hmac_sync(sha1_sync, this._decRtpAuth, this._macView.subarray(0, authTagStart + 4));
+    if (!_tagMatches(mac, srtpPacket, authTagStart)) return null;
 
-    var encPayload = authenticated.subarray(headerLen);
     _buildRtpIv(this._ivScratch, this._decRtpSalt, ssrc, index);
-    var decPayload = _aesCmEncrypt(this._decRtpKey, this._ivScratch, encPayload);
+    var decPayload = _aesCmEncrypt(this._decRtpKey, this._ivScratch, _view(srtpPacket, headerLen, authTagStart));
 
     plaintext = Buffer.allocUnsafe(headerLen + decPayload.length);
-    authenticated.copy(plaintext, 0, 0, headerLen);
-    decPayload.copy(plaintext, headerLen);
+    srtpPacket.copy(plaintext, 0, 0, headerLen);
+    plaintext.set(decPayload, headerLen);
   }
 
   // ── Auth passed. Replay check + window update (RFC 3711 §3.3.2). ──
@@ -393,28 +393,20 @@ SrtpSession.prototype.encryptRtcp = function (rtcpPacket) {
   this._srtcpSendIndex = (this._srtcpSendIndex + 1) & 0x7FFFFFFF;
 
   var headerLen = 8;   // sender SSRC + packet type header
-  var payload = rtcpPacket.subarray(headerLen);
+  var payload = _view(rtcpPacket, headerLen, rtcpPacket.length);
   var indexWord = (0x80000000 | index) >>> 0;
 
   if (this._gcm) {
     // ── RFC 7714 §9: layout = header(8) | ciphertext | tag(16) | E+index(4)
     //    AAD = header(8) || E+index word.
     _buildGcmRtcpIv(this._ivScratch, this._encRtcpSalt, ssrc, index);
-    var iv = this._ivScratch.subarray(0, 12);
     rtcpPacket.copy(this._aadScratch, 0, 0, 8);
     this._aadScratch.writeUInt32BE(indexWord, 8);
 
-    var cipher = crypto.createCipheriv(this._gcmCipher, this._encRtcpKey, iv, { authTagLength: GCM_TAG_LEN });
-    cipher.setAAD(this._aadScratch);
-    var ct = cipher.update(payload);
-    cipher.final();
-    var tag = cipher.getAuthTag();
-
-    var outG = Buffer.allocUnsafe(8 + ct.length + GCM_TAG_LEN + 4);
+    var outG = Buffer.allocUnsafe(8 + payload.length + GCM_TAG_LEN + 4);
     rtcpPacket.copy(outG, 0, 0, 8);
-    ct.copy(outG, 8);
-    tag.copy(outG, 8 + ct.length);
-    outG.writeUInt32BE(indexWord, 8 + ct.length + GCM_TAG_LEN);
+    this._encRtcpGcm.encrypt_into_sync(outG, 8, this._iv12, payload, this._aadView);
+    outG.writeUInt32BE(indexWord, 8 + payload.length + GCM_TAG_LEN);
     return outG;
   }
 
@@ -425,13 +417,11 @@ SrtpSession.prototype.encryptRtcp = function (rtcpPacket) {
   var outLen = rtcpPacket.length + 4 + AUTH_TAG_LEN;
   var out = Buffer.allocUnsafe(outLen);
   rtcpPacket.copy(out, 0, 0, headerLen);
-  encPayload.copy(out, headerLen);
+  out.set(encPayload, headerLen);
   out.writeUInt32BE(indexWord, rtcpPacket.length);
 
   // HMAC covers encrypted packet + index (everything before the tag)
-  var hmac = crypto.createHmac('sha1', this._encRtcpAuth);
-  hmac.update(out.subarray(0, rtcpPacket.length + 4));
-  hmac.digest().copy(out, rtcpPacket.length + 4, 0, AUTH_TAG_LEN);
+  _copyTag(hmac_sync(sha1_sync, this._encRtcpAuth, _view(out, 0, rtcpPacket.length + 4)), out, rtcpPacket.length + 4);
 
   return out;
 };
@@ -448,17 +438,13 @@ SrtpSession.prototype.decryptRtcp = function (srtcpPacket) {
   var authTagStart = srtcpPacket.length - AUTH_TAG_LEN;
   var indexStart = authTagStart - 4;
 
-  var authenticated = srtcpPacket.subarray(0, authTagStart);
-  var authTag = srtcpPacket.subarray(authTagStart);
   var indexWord = srtcpPacket.readUInt32BE(indexStart);
   var isEncrypted = !!(indexWord & 0x80000000);
   var index = indexWord & 0x7FFFFFFF;
 
   // Verify auth
-  var hmac = crypto.createHmac('sha1', this._decRtcpAuth);
-  hmac.update(authenticated);
-  var expectedTag = hmac.digest().subarray(0, AUTH_TAG_LEN);
-  if (!_constantTimeEquals(authTag, expectedTag)) return null;
+  var mac = hmac_sync(sha1_sync, this._decRtcpAuth, _view(srtcpPacket, 0, authTagStart));
+  if (!_tagMatches(mac, srtcpPacket, authTagStart)) return null;
 
   var ssrc = srtcpPacket.readUInt32BE(4);
   if (!this._srtcpReplayOk(ssrc, index)) return null;
@@ -470,12 +456,11 @@ SrtpSession.prototype.decryptRtcp = function (srtcpPacket) {
 
   var headerLen = 8;
   _buildRtcpIv(this._ivScratch, this._decRtcpSalt, ssrc, index);
-  var encPayload = srtcpPacket.subarray(headerLen, indexStart);
-  var decPayload = _aesCmEncrypt(this._decRtcpKey, this._ivScratch, encPayload);
+  var decPayload = _aesCmEncrypt(this._decRtcpKey, this._ivScratch, _view(srtcpPacket, headerLen, indexStart));
 
   var out = Buffer.allocUnsafe(headerLen + decPayload.length);
   srtcpPacket.copy(out, 0, 0, headerLen);
-  decPayload.copy(out, headerLen);
+  out.set(decPayload, headerLen);
   return out;
 };
 
@@ -490,28 +475,19 @@ SrtpSession.prototype._decryptRtcpGcm = function (srtcpPacket) {
   var ssrc = srtcpPacket.readUInt32BE(4);
 
   _buildGcmRtcpIv(this._ivScratch, this._decRtcpSalt, ssrc, index);
-  var iv = this._ivScratch.subarray(0, 12);
   srtcpPacket.copy(this._aadScratch, 0, 0, 8);
   this._aadScratch.writeUInt32BE(indexWord, 8);
 
-  try {
-    var decipher = crypto.createDecipheriv(this._gcmCipher, this._decRtcpKey, iv, { authTagLength: GCM_TAG_LEN });
-    // For unencrypted-but-authenticated packets (E=0), the "ciphertext"
-    // region is still covered by the tag as AAD-style data. We only
-    // support E=1 for GCM here — WebRTC always encrypts RTCP.
-    if (!isEncrypted) return null;
-    decipher.setAAD(this._aadScratch);
-    decipher.setAuthTag(srtcpPacket.subarray(tagStart, indexStart));
-    var pt = decipher.update(srtcpPacket.subarray(8, tagStart));
-    decipher.final();   // throws on auth failure
-    if (!this._srtcpReplayOk(srtcpPacket.readUInt32BE(4), index)) return null;
-    var out = Buffer.allocUnsafe(8 + pt.length);
-    srtcpPacket.copy(out, 0, 0, 8);
-    pt.copy(out, 8);
-    return out;
-  } catch (e) {
-    return null;
-  }
+  // For unencrypted-but-authenticated packets (E=0), the "ciphertext"
+  // region is still covered by the tag as AAD-style data. We only
+  // support E=1 for GCM here — WebRTC always encrypts RTCP.
+  if (!isEncrypted) return null;
+  var out = Buffer.allocUnsafe(tagStart);
+  // null when the tag does not verify
+  if (this._decRtcpGcm.decrypt_into_sync(out, 8, this._iv12, _view(srtcpPacket, 8, indexStart), this._aadView) === null) return null;
+  if (!this._srtcpReplayOk(ssrc, index)) return null;
+  srtcpPacket.copy(out, 0, 0, 8);
+  return out;
 };
 
 /**
@@ -706,7 +682,7 @@ function _kdfSalt(masterSalt) {
  * XOR'd with the session salt.
  */
 function _buildRtpIv(iv, salt, ssrc, packetIndex) {
-  salt.copy(iv, 0, 0, 14);
+  for (var i = 0; i < 14; i++) iv[i] = salt[i];
   iv[14] = 0;
   iv[15] = 0;
 
@@ -725,7 +701,7 @@ function _buildRtpIv(iv, salt, ssrc, packetIndex) {
 
 function _buildRtcpIv(iv, salt, ssrc, index) {
   // See RFC 3711 §4.1.1 SRTCP IV — decomposition matches libsrtp/pion.
-  salt.copy(iv, 0, 0, 14);
+  for (var i = 0; i < 14; i++) iv[i] = salt[i];
   iv[14] = 0;
   iv[15] = 0;
 
@@ -786,13 +762,31 @@ function _buildGcmRtcpIv(iv, salt, ssrc, index) {
 }
 
 /**
- * AES-128-CM keystream applied to a payload (native aes-128-ctr).
+ * AES-128-CM keystream applied to a payload (AES-CTR).
  */
 function _aesCmEncrypt(key, iv, payload) {
-  var cipher = crypto.createCipheriv('aes-128-ctr', key, iv);
-  var out = cipher.update(payload);
-  cipher.final();
-  return out;
+  return aes_ctr_sync(key, iv, payload);
+}
+
+/** A plain Uint8Array over buf[start..end) (see _ivScratch for why not a Buffer view). */
+function _view(buf, start, end) {
+  return new Uint8Array(buf.buffer, buf.byteOffset + start, end - start);
+}
+
+/** The 80-bit tag: the first AUTH_TAG_LEN bytes of `mac`, written at out[at..]. */
+function _copyTag(mac, out, at) {
+  for (var i = 0; i < AUTH_TAG_LEN; i++) out[at + i] = mac[i];
+}
+
+/**
+ * Does the packet's tag at pkt[at..] match the first AUTH_TAG_LEN bytes of
+ * `mac`? In constant time, compared where the bytes are - no view of either.
+ */
+function _tagMatches(mac, pkt, at) {
+  if (pkt.length - at !== AUTH_TAG_LEN) return false;
+  var diff = 0;
+  for (var i = 0; i < AUTH_TAG_LEN; i++) diff |= mac[i] ^ pkt[at + i];
+  return diff === 0;
 }
 
 /**
@@ -804,23 +798,10 @@ function _deriveKey(masterKey, masterSalt, label, length) {
   iv[7] ^= label;            // byte 7: salt[7] XOR label
   // bytes 14..15 stay zero — this is the counter start
 
-  var kdfCipher = (masterKey.length === 32) ? 'aes-256-ctr' : 'aes-128-ctr';
-  var cipher = crypto.createCipheriv(kdfCipher, masterKey, iv);
-  var derived = cipher.update(Buffer.alloc(length <= 16 ? 16 : 32));
-  cipher.final();
-  return derived.subarray(0, length);
+  // AES-128-CTR or AES-256-CTR, by the master key's length
+  var derived = aes_ctr_sync(_view(masterKey, 0, masterKey.length), new Uint8Array(iv), new Uint8Array(length <= 16 ? 16 : 32));
+  return derived.slice(0, length);   // a plain Uint8Array: see _ivScratch
 }
-
-/**
- * Constant-time buffer comparison — protects against timing attacks on auth tag.
- */
-function _constantTimeEquals(a, b) {
-  if (a.length !== b.length) return false;
-  var diff = 0;
-  for (var i = 0; i < a.length; i++) diff |= a[i] ^ b[i];
-  return diff === 0;
-}
-
 
 export { SrtpSession, AUTH_TAG_LEN, GCM_TAG_LEN, PROFILE_CM, PROFILE_GCM, PROFILE_GCM_256 };
 export default SrtpSession;

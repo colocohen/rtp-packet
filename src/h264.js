@@ -27,6 +27,7 @@ import {
 
 var CLOCK_RATE = 90000;
 var START_CODE_4 = Buffer.from([0, 0, 0, 1]);
+var bufferCopy = Buffer.prototype.copy;
 
 // ═══════════════════════════════════════════════════════════════════
 //  Packetizer
@@ -304,9 +305,13 @@ H264Depacketizer.prototype.depacketize = function (packet) {
 
     if (startBit) {
       this._fuHeader = (payload[0] & 0x60) | type;        // reconstruct NAL header (F+NRI from indicator, type from FU header)
-      var hdrBuf = Buffer.allocUnsafe(1);                 // cheaper than Buffer.from([...])
-      hdrBuf[0] = this._fuHeader;
-      this._fuFragments = [hdrBuf];
+      // A reassembled NALU is kept as [headerByte, payload, payload, ...]
+      // — the whole FU-A payloads, their 2-byte FU prefix skipped when
+      // _joinAnnexB copies them into the access unit. Concatenating here
+      // first copied every fragment twice (once into the NALU, once into
+      // the access unit) and allocated a view per fragment plus the
+      // NALU's buffer, all garbage once the access unit was built.
+      this._fuFragments = [this._fuHeader];
     } else if (this._fuFragments.length === 0) {
       // Mid/end fragment arrived but we never saw a start — previous start must
       // have been lost. Drop this fragment rather than accumulate garbage that
@@ -314,13 +319,12 @@ H264Depacketizer.prototype.depacketize = function (packet) {
       emitError(this, new Error('H264Depacketizer: FU-A fragment without start (start packet lost)'));
       return;
     }
-    this._fuFragments.push(payload.subarray(2));
+    this._fuFragments.push(payload);
 
     if (endBit) {
-      var fullNalu = Buffer.concat(this._fuFragments);
+      this._nalus.push(this._fuFragments);
+      if ((this._fuHeader & 0x1F) === 5) this._sawIDR = true;
       this._fuFragments = [];
-      this._nalus.push(fullNalu);
-      if ((fullNalu[0] & 0x1F) === 5) this._sawIDR = true;
     }
 
   } else {
@@ -448,16 +452,34 @@ function _splitAnnexB(buf) {
 
 /**
  * Join NALUs into an Annex-B access unit (4-byte start code before each NALU).
+ * An entry is either a NALU Buffer or a reassembled FU-A NALU in the
+ * depacketizer's [headerByte, payload, ...] form (FU prefix not yet
+ * stripped). Copies go through Buffer.prototype.copy so a Uint8Array
+ * payload works as it did with Buffer.concat.
  */
 function _joinAnnexB(nalus) {
   var totalSize = 0;
-  for (var i = 0; i < nalus.length; i++) totalSize += 4 + nalus[i].length;
+  for (var i = 0; i < nalus.length; i++) {
+    var n = nalus[i];
+    if (Array.isArray(n)) {
+      totalSize += 4 + 1;
+      for (var f = 1; f < n.length; f++) totalSize += n[f].length - 2;
+    } else {
+      totalSize += 4 + n.length;
+    }
+  }
 
   var out = Buffer.allocUnsafe(totalSize);
   var off = 0;
   for (var j = 0; j < nalus.length; j++) {
+    var nj = nalus[j];
     START_CODE_4.copy(out, off); off += 4;
-    nalus[j].copy(out, off); off += nalus[j].length;
+    if (Array.isArray(nj)) {
+      out[off++] = nj[0];
+      for (var g = 1; g < nj.length; g++) off += bufferCopy.call(nj[g], out, off, 2);
+    } else {
+      nalus[j].copy(out, off); off += nj.length;
+    }
   }
   return out;
 }

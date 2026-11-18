@@ -47,7 +47,7 @@
 //   - RFC 4588 §4      — RTX payload format (OSN prepended, separate SSRC)
 //
 
-import { randomBytes } from 'node:crypto';
+import { random_bytes_sync } from 'cryptographic-primitives/random.js';
 
 /**
  * Default size of the per-SSRC retransmission ring buffer, in packets.
@@ -280,7 +280,7 @@ function parseRtxPacket(rtxPkt, opts) {
  * RFC 3550 §5.1: the initial sequence number SHOULD be unpredictable to
  * prevent plaintext attack against the (hypothetical) stream cipher.
  * Under SRTP the cipher keying is independent so the requirement is
- * relaxed in practice, but using crypto.randomBytes (CSPRNG) instead of
+ * relaxed in practice, but using a CSPRNG (cryptographic-primitives' random_bytes_sync) instead of
  * Math.random (PRNG with predictable output given a few samples) costs
  * nothing and is what the spec asks for.
  *
@@ -288,10 +288,15 @@ function parseRtxPacket(rtxPkt, opts) {
  * secure — given ~5 sequential outputs an attacker can recover internal
  * state and predict future outputs. We don't currently expose multiple
  * RtxStream initial seqs from the same process to anyone who might care,
- * but the cost of doing it correctly is one syscall (randomBytes(2)),
+ * but the cost of doing it correctly is two random bytes,
  * called once per RtxStream constructor — negligible overhead, full
  * spec alignment.
  */
+function _random16() {
+  var b = random_bytes_sync(2);
+  return (b[0] << 8) | b[1];
+}
+
 function RtxStream(opts) {
   opts = opts || {};
   if (opts.rtxSsrc == null || opts.rtxPt == null) {
@@ -301,7 +306,7 @@ function RtxStream(opts) {
   this._rtxPt   = opts.rtxPt & 0x7F;
   this._seq     = (opts.initialSeq != null)
     ? (opts.initialSeq & 0xFFFF)
-    : randomBytes(2).readUInt16BE(0);
+    : _random16();
 }
 
 RtxStream.prototype.wrap = function (origPkt) {

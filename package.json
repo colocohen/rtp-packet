@@ -1,6 +1,6 @@
 {
   "name": "rtp-packet",
-  "version": "0.5.1",
+  "version": "0.6.0",
   "description": "RTP/RTCP packetization for Node.js",
   "type": "module",
   "main": "index.js",
@@ -25,13 +25,31 @@
     "node": ">=16.0.0"
   },
   "keywords": [
-    "rtp", "rtcp", "h264", "h265", "vp8", "vp9", "av1",
-    "opus", "aac", "g711", "g722", "dtmf",
-    "webrtc", "streaming", "srtp", "jitter-buffer",
-    "packetizer", "depacketizer", "rtx", "nack", "transport-cc"
+    "rtp",
+    "rtcp",
+    "h264",
+    "h265",
+    "vp8",
+    "vp9",
+    "av1",
+    "opus",
+    "aac",
+    "g711",
+    "g722",
+    "dtmf",
+    "webrtc",
+    "streaming",
+    "srtp",
+    "jitter-buffer",
+    "packetizer",
+    "depacketizer",
+    "rtx",
+    "nack",
+    "transport-cc"
   ],
   "dependencies": {
-    "flat-ranges": "^2.2.0"
+    "flat-ranges": "^2.3.0",
+    "cryptographic-primitives": "^0.1.0"
   },
   "funding": [
     {
