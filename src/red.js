@@ -109,7 +109,11 @@ REDPacketizer.prototype._do = function (chunk, withMeta) {
   data.copy(payload, o);
 
   // History for future packets
-  this._history.push({ rtpTs: rtpTs, data: data });
+  // A copy: this is the one packetizer that keeps a chunk's bytes past the
+  // call, and they went into the NEXT packet as its redundant block. Kept by
+  // reference, a caller that reuses its buffer (as it may with every other
+  // packetizer) sent its new contents labelled as the previous frame.
+  this._history.push({ rtpTs: rtpTs, data: Buffer.from(data) });
   var keep = Math.max(1, this._redundancy);
   while (this._history.length > keep) this._history.shift();
 
@@ -164,6 +168,13 @@ REDDepacketizer.prototype.depacketize = function (pkt) {
     var blk = blocks[i];
     var ts = (pkt.timestamp - blk.tsOffset) >>> 0;
     if (this._seen.has(ts)) continue;
+    // Also against the blocks taken from THIS packet: _seen is only updated
+    // in the emit loop below, so a redundant block with offset 0 (the same
+    // timestamp as the primary) went out twice, the same frame decoded twice.
+    // The primary is last in wire order, so on a tie it replaces the copy.
+    var dup = -1;
+    for (var k = 0; k < out.length; k++) if (out[k].ts === ts) { dup = k; break; }
+    if (dup >= 0) { out[dup] = { ts: ts, blk: blk }; continue; }
     out.push({ ts: ts, blk: blk });
   }
   out.sort(function (a, b) { return (a.ts - b.ts) | 0; });   // wrap-safe for small windows

@@ -159,7 +159,10 @@ function buildREMB(senderSsrc, mediaSsrcs, bitrate) {
   // BR mantissa and exponent: bitrate = mantissa × 2^exp
   var exp = 0;
   var mantissa = Math.floor(bitrate);
-  while (mantissa > 0x3FFFF) { mantissa >>= 1; exp++; }
+  // Halve with arithmetic, not `>>= 1`: the shift works on int32, so from
+  // 2^31 bps up the mantissa came out negative or wrapped (2^31 -> 0,
+  // 5 Gbps -> 705 Mbps).
+  while (mantissa > 0x3FFFF) { mantissa = Math.floor(mantissa / 2); exp++; }
   buf[16] = (numSsrcs & 0xFF);
   buf[17] = ((exp & 0x3F) << 2) | ((mantissa >> 16) & 0x03);
   buf[18] = (mantissa >> 8) & 0xFF;
@@ -580,7 +583,10 @@ function _parseNackEntries(buf, off) {
     var blp = buf.readUInt16BE(off + 2);
     lost.push(pid);
     for (var bit = 0; bit < 16; bit++) {
-      if (blp & (1 << bit)) lost.push(pid + bit + 1);
+      // & 0xFFFF: a PID near the top wraps (65535 + 1 is seq 0). Unwrapped,
+      // the list held 65536, 65537..., which no sent packet has, so those
+      // losses were never retransmitted.
+      if (blp & (1 << bit)) lost.push((pid + bit + 1) & 0xFFFF);
     }
     off += 4;
   }

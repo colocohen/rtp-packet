@@ -822,6 +822,10 @@ function setHeaderExtension(rtpPacket, id, data) {
   var cc = rtpPacket[0] & 0x0F;
   var hasExt = !!(rtpPacket[0] & 0x10);
   var fixedHeaderEnd = RTP_HEADER_SIZE + cc * 4;    // end of CSRC list
+  // A CC that claims more CSRCs than the packet holds: without this check the
+  // copy below filled only part of the allocUnsafe buffer, and the rest (old
+  // heap memory: other packets, keys, strings) went out on the wire as "CSRCs".
+  if (rtpPacket.length < fixedHeaderEnd) return rtpPacket;
 
   var existingExts = {};
   var extBlockLen = 0;
@@ -875,6 +879,10 @@ function setHeaderExtensions(rtpPacket, extsMap) {
   var cc = rtpPacket[0] & 0x0F;
   var hasExt = !!(rtpPacket[0] & 0x10);
   var fixedHeaderEnd = RTP_HEADER_SIZE + cc * 4;    // end of CSRC list
+  // A CC that claims more CSRCs than the packet holds: without this check the
+  // copy below filled only part of the allocUnsafe buffer, and the rest (old
+  // heap memory: other packets, keys, strings) went out on the wire as "CSRCs".
+  if (rtpPacket.length < fixedHeaderEnd) return rtpPacket;
 
   var existingExts = {};
   var extBlockLen = 0;

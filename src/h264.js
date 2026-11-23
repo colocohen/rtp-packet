@@ -41,9 +41,13 @@ var bufferCopy = Buffer.prototype.copy;
  * @param {number}  opts.payloadType              required, 0-127
  * @param {number} [opts.mtu]                     default 1400
  * @param {number} [opts.initialSequenceNumber]   default random
+ * @param {string} [opts.format]                  the chunks' framing, as WebCodecs' avc.format:
+ *                                                'annexb' (start codes) or 'avc' (4-byte
+ *                                                lengths). Unset: told from the data.
  */
 function H264Packetizer(opts) {
   initPacketizer(this, opts);
+  this._format = _checkFormat(this, opts.format, 'avc');
 }
 
 /**
@@ -117,7 +121,7 @@ function _packetize(self, chunk, withMeta) {
       nalus[k] = _toBuffer(chunk.nalus[k]);
     }
   } else {
-    nalus = _splitNALUs(_toBuffer(chunk.data));
+    nalus = _splitNALUs(_toBuffer(chunk.data), self._format);
   }
   if (!nalus.length) return [];
 
@@ -188,6 +192,7 @@ function H264Depacketizer(opts) {
   this._fuFragments = [];  // in-flight FU-A fragments
   this._fuHeader = 0;      // reconstructed NAL header byte for FU-A
   this._sawIDR = false;    // tracks if any NALU in this AU was IDR (type 5)
+  this._ts = null;         // RTP timestamp of the access unit being built
 }
 
 /**
@@ -268,6 +273,20 @@ H264Depacketizer.peekKeyframe = function (payload) {
 H264Depacketizer.prototype.depacketize = function (packet) {
   if (!checkDepacketizePayload(this, packet, 1)) return;
 
+  // A new RTP timestamp is a new access unit (RFC 6184 §5.1 / RFC 7798
+  // §4.1: all packets of one AU share it). When the previous AU's marker
+  // packet was lost, its NALUs used to stay in _nalus and went out at the
+  // head of THIS AU: a slice of the old picture glued into the new one (and
+  // the whole AU typed 'key' when the lost one was an IDR). The incomplete
+  // AU is dropped instead, as libwebrtc's packet buffer drops a frame it
+  // cannot complete; a half-built FU from it goes with it.
+  if (this._ts !== null && packet.timestamp !== this._ts) {
+    this._nalus = [];
+    this._fuFragments = [];
+    this._sawIDR = false;
+  }
+  this._ts = packet.timestamp;
+
   var payload = packet.payload;
   var naluType = payload[0] & 0x1F;
 
@@ -338,6 +357,7 @@ H264Depacketizer.prototype.depacketize = function (packet) {
     var isKey = this._sawIDR;
     this._nalus = [];
     this._sawIDR = false;
+    this._ts = null;
 
     this._output({
       data: accessUnit,
@@ -352,6 +372,7 @@ H264Depacketizer.prototype.reset = function () {
   this._fuFragments = [];
   this._fuHeader = 0;
   this._sawIDR = false;
+  this._ts = null;
 };
 
 H264Depacketizer.prototype.close = function () {
@@ -373,23 +394,33 @@ H264Depacketizer.prototype.close = function () {
  *   AVCC    — NALUs prefixed by 4-byte big-endian lengths. What MP4
  *             containers and WebCodecs (avc format) hand out.
  *
- * Detection: a leading start code means Annex-B. Otherwise we attempt a
- * strict AVCC walk — 4-byte lengths that exactly tile the buffer, each
- * NALU non-empty with a plausible NAL header. If the walk fails, we
- * fall back to the Annex-B splitter (which degrades to "whole buffer is
- * one NALU" for unframed input, preserving the old behavior).
+ * The packetizer's `format` says which ('annexb' / 'avc'). Without it the
+ * data tells: a strict AVCC walk first — 4-byte lengths that exactly tile
+ * the buffer, each NALU non-empty with a plausible NAL header — and the
+ * Annex-B splitter when it fails (which degrades to "whole buffer is one
+ * NALU" for unframed input, preserving the old behavior).
+ *
+ * The walk goes first because a leading 00 00 01 is not proof of Annex-B:
+ * it is also the length of an AVCC NALU of 256-511 bytes (00 00 01 xx).
+ * A leading start code used to settle it, and 13 of 105 access units of
+ * a WebCodecs H.264 encoder (avc format) went out split at the wrong
+ * places. Annex-B data almost never tiles as lengths by chance; when the
+ * framing is known, `format` takes the guess away.
  */
-function _splitNALUs(buf) {
-  if (_startsWithStartCode(buf)) return _splitAnnexB(buf);
+function _splitNALUs(buf, format) {
+  if (format === 'annexb') return _splitAnnexB(buf);
   var avcc = _trydSplitAVCC(buf);
   if (avcc) return avcc;
   return _splitAnnexB(buf);
 }
 
-function _startsWithStartCode(buf) {
-  if (buf.length >= 3 && buf[0] === 0 && buf[1] === 0 && buf[2] === 1) return true;
-  if (buf.length >= 4 && buf[0] === 0 && buf[1] === 0 && buf[2] === 0 && buf[3] === 1) return true;
-  return false;
+/** opts.format: 'annexb', or the length-prefixed name (`lp`), or unset. */
+function _checkFormat(self, format, lp) {
+  if (format == null) return null;
+  if (format !== 'annexb' && format !== lp) {
+    throw new TypeError(self.constructor.name + ': opts.format must be "annexb" or "' + lp + '"');
+  }
+  return format;
 }
 
 /**
@@ -421,15 +452,19 @@ function _trydSplitAVCC(buf) {
 function _splitAnnexB(buf) {
   var nalus = [];
   var i = 0, len = buf.length;
+  var found = false;
 
   // Find first start code
   while (i < len - 3) {
     if (buf[i] === 0 && buf[i + 1] === 0) {
-      if (buf[i + 2] === 1) { i += 3; break; }
-      if (i < len - 3 && buf[i + 2] === 0 && buf[i + 3] === 1) { i += 4; break; }
+      if (buf[i + 2] === 1) { i += 3; found = true; break; }
+      if (i < len - 3 && buf[i + 2] === 0 && buf[i + 3] === 1) { i += 4; found = true; break; }
     }
     i++;
   }
+  // No start code: unframed input, the whole buffer is one NALU. (The
+  // scan above leaves i at the end, and only the last 3 bytes went out.)
+  if (!found) return len > 0 ? [buf] : [];
   var naluStart = i;
 
   while (i < len - 3) {

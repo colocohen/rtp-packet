@@ -578,8 +578,11 @@ NackGenerator.prototype._waitNumberOfPackets = function (probability) {
  * @param {number}  extSeq      — extended seq number (caller maintains cycles)
  * @param {boolean} isKeyframe  — true if this is the first packet of a keyframe
  * @param {boolean} isRecovered — true if this came via RTX (don't gap-detect off it)
+ * @param {number}  [now]       — current time in ms, on the SAME clock as the
+ *                                `now` given to buildFeedback (default Date.now())
  */
-NackGenerator.prototype.observePacket = function (extSeq, isKeyframe, isRecovered) {
+NackGenerator.prototype.observePacket = function (extSeq, isKeyframe, isRecovered, now) {
+  if (typeof now !== 'number') now = Date.now();
   // Record arrival in _received unconditionally. Even RTX-recovered
   // packets count as "we have this one" for future NACK suppression.
   flatRanges.add(this._received, [extSeq, extSeq + 1]);
@@ -636,7 +639,7 @@ NackGenerator.prototype.observePacket = function (extSeq, isKeyframe, isRecovere
       this._evictMissingBelow(extSeq);
       // Don't add the new gap — those packets are useless.
     } else {
-      this._addMissingRange(this._highestExtSeq + 1, extSeq);
+      this._addMissingRange(this._highestExtSeq + 1, extSeq, now);
     }
   }
 
@@ -661,7 +664,7 @@ NackGenerator.prototype.observePacket = function (extSeq, isKeyframe, isRecovere
  *
  * Both paths bound memory in the face of catastrophic loss.
  */
-NackGenerator.prototype._addMissingRange = function (start, end) {
+NackGenerator.prototype._addMissingRange = function (start, end, now) {
   // Pre-count actual additions: scan [start, end) and skip seqs already
   // in _received. The latter case happens when an RTX retransmit delivers
   // a packet BEFORE the natural-order arrival fires the gap detection —
@@ -725,7 +728,11 @@ NackGenerator.prototype._addMissingRange = function (start, end) {
   // the configured 20ms). Default sendDelay=0 hid this for normal
   // sessions; production tunings with sendDelay=5-20ms (recommended
   // for reordered networks) need the precise timing here.
-  var now = Date.now();
+  //
+  // `now` comes from observePacket, on the caller's clock. It used to be
+  // Date.now() here whatever clock buildFeedback(now) was given: with any
+  // other one (performance.now(), a clock that starts at 0) now - createdAt
+  // was hugely negative, "< sendDelay" held forever, and no NACK went out.
 
   for (var seq = start; seq < end; seq++) {
     // Don't add if we've already received it (defensive — a recovered
@@ -734,7 +741,7 @@ NackGenerator.prototype._addMissingRange = function (start, end) {
 
     this._missing.set(seq, {
       createdAt:  now,           // gap-detection wall time (see comment above)
-      sentAt:     0,             // 0 = never sent yet
+      sentAt:     0,             // meaningful once retries > 0
       retries:    0,
       sendAtSeq:  seq + wait,    // libwebrtc-style: NACK once highest > this
     });
@@ -857,7 +864,10 @@ NackGenerator.prototype.buildFeedback = function (now) {
   var highest = this._highestExtSeq;
 
   this._missing.forEach(function (info, seq) {
-    if (info.sentAt === 0) {
+    // retries, not sentAt === 0, says "never sent": on a clock that starts
+    // at 0, a NACK sent at time 0 looked unsent and went out again on every
+    // poll, without waiting a round trip.
+    if (info.retries === 0) {
       // First-time send. Two gates must clear:
       //   (1) sendNackDelayMs elapsed since gap detected (time-based)
       //   (2) highest >= sendAtSeq                       (seq-based, reordering)

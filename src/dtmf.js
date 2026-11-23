@@ -15,6 +15,12 @@
  *   - marker=1 on the FIRST packet of an event only.
  *   - The final packet sets E=1 and is retransmitted twice (3 total end
  *     packets) for loss robustness — receivers dedupe by timestamp.
+ *   - Long events (§2.5.1.3): the duration field is 16 bits — 1.36 s at
+ *     48 kHz. An event that outlasts it goes on in a new SEGMENT: the
+ *     segment that filled up is reported once with duration 0xFFFF, the
+ *     next one starts at its timestamp + 0xFFFF with the duration counted
+ *     from 0 again, marker 0 (it is the same event). libwebrtc splits the
+ *     same way (rtp_sender_audio.cc).
  *
  * Division of labor: this class owns byte layout + per-event RTP field
  * discipline (ts/marker/E/duration). The CALLER owns real-time pacing
@@ -49,8 +55,8 @@ function DtmfPacketizer(opts) {
 
   // Active-event state
   this._eventCode = null;
-  this._eventTs = 0;          // fixed RTP ts for the event
-  this._elapsedTicks = 0;
+  this._eventTs = 0;          // fixed RTP ts for the event (of its current segment)
+  this._elapsedTicks = 0;     // since the start of the current segment
   this._first = false;
 }
 
@@ -87,13 +93,29 @@ DtmfPacketizer.prototype._buildPayload = function (end, volume) {
   return p;
 };
 
+// Move the event on to its next segment (§2.5.1.3, see the top of the file)
+// for as long as the elapsed time does not fit in 16 bits. Previously the
+// duration stayed at 0xFFFF: a 3 s tone (the W3C API allows up to 6 s)
+// reached the peer as 1.36 s.
+DtmfPacketizer.prototype._nextSegment = function () {
+  while (this._elapsedTicks > 0xFFFF) {
+    this._eventTs = (this._eventTs + 0xFFFF) >>> 0;
+    this._elapsedTicks -= 0xFFFF;
+  }
+};
+
 /**
  * Emit one update packet, advancing elapsed time by deltaMs.
  * Returns a single serialized RTP packet (Buffer).
  */
 DtmfPacketizer.prototype.update = function (deltaMs, opts) {
   if (this._eventCode === null) throw new Error('DtmfPacketizer: no active event');
+  // A segment that already went out full (0xFFFF) is over: this packet
+  // belongs to the next one.
+  if (this._elapsedTicks >= 0xFFFF) this._nextSegment();
   this._elapsedTicks += Math.round(deltaMs * this.clockRate / 1000);
+  // Crossing 0xFFFF now: this packet closes the segment with 0xFFFF (from
+  // _buildPayload's clamp), and the next call carries on in a new one.
   var pkt = serialize({
     payloadType: this.payloadType,
     sequenceNumber: this._takeSeq(),
@@ -109,12 +131,28 @@ DtmfPacketizer.prototype.update = function (deltaMs, opts) {
 /**
  * Finish the event: emits the E=1 packet plus 2 retransmits (§2.5.1.2
  * — 3 identical end packets except for their sequence numbers).
- * Returns an array of 3 serialized RTP packets and clears event state.
+ * Returns an array of 3 serialized RTP packets (4 when the end crosses into
+ * a new segment: the full segment's last report comes first) and clears
+ * event state.
  */
 DtmfPacketizer.prototype.endEvent = function (finalDeltaMs, opts) {
   if (this._eventCode === null) throw new Error('DtmfPacketizer: no active event');
+  if (this._elapsedTicks >= 0xFFFF) this._nextSegment();
   if (finalDeltaMs) this._elapsedTicks += Math.round(finalDeltaMs * this.clockRate / 1000);
   var out = [];
+  // Ending past the segment's limit: report it full first, then end in the next.
+  if (this._elapsedTicks > 0xFFFF) {
+    out.push(serialize({
+      payloadType: this.payloadType,
+      sequenceNumber: this._takeSeq(),
+      timestamp: this._eventTs,
+      ssrc: this.ssrc,
+      marker: this._first,
+      payload: this._buildPayload(false, (opts && opts.volume) != null ? opts.volume : 10),
+    }));
+    this._first = false;
+    this._nextSegment();
+  }
   var payload = this._buildPayload(true, (opts && opts.volume) != null ? opts.volume : 10);
   for (var i = 0; i < 3; i++) {
     out.push(serialize({
@@ -152,24 +190,65 @@ function parseDtmf(payload) {
 /**
  * DTMFDepacketizer — library-convention counterpart ({output} callback,
  * depacketize(parsedPacket)). Emits one event per E=1 packet (deduped
- * by event timestamp, since the end packet is sent 3x).
+ * by event timestamp, since the end packet is sent 3x). The duration it
+ * reports is the whole event's, segments of a long event (§2.5.1.3) added up.
  */
 function DTMFDepacketizer(opts) {
   if (!(this instanceof DTMFDepacketizer)) return new DTMFDepacketizer(opts);
   this._output = (opts && opts.output) || function () {};
   this._lastEndTs = null;
+  this._lastEndRaw = null;    // dedupe key for raw payloads (no timestamp)
+  this._segTs = null;         // timestamp of the segment being received
+  this._segEvent = -1;
+  this._segDur = 0;           // last duration seen in that segment
+  this._carry = 0;            // ticks of the event's earlier segments
 }
 DTMFDepacketizer.prototype.depacketize = function (pkt) {
   if (!this._output) return;                 // closed — ignore (parity with other codecs)
   var payload = pkt && (pkt.payload || pkt);
   var ev = parseDtmf(payload);
   if (!ev) return;
+
+  // A raw payload (accepted above) carries no timestamp. It used to be read
+  // as 0 for every packet, so every tone after the first was dropped as a
+  // "retransmit". Without a timestamp the 3 end packets are recognised as
+  // identical end packets in a row; any non-end packet in between (every
+  // tone that lasts past its first report has some) opens a new tone.
+  if (pkt === payload || pkt.timestamp == null) {
+    if (!ev.end) { this._lastEndRaw = null; return; }
+    var key = ev.event + ':' + ev.duration + ':' + ev.volume;
+    if (this._lastEndRaw === key) return;
+    this._lastEndRaw = key;
+    this._output({ tone: ev.tone, event: ev.event, volume: ev.volume,
+                   duration: ev.duration, timestamp: null });
+    return;
+  }
+
+  var ts = pkt.timestamp >>> 0;
+  // A new timestamp for the same event right after a full segment (0xFFFF)
+  // is the event's next segment: keep the time already elapsed. Anything
+  // else is a new event. (The gap between the two timestamps is what passed,
+  // whether the sender put the new segment at +0xFFFF, as the RFC does, or
+  // at the current time, as libwebrtc does.)
+  if (ts !== this._segTs) {
+    var gap = (ts - this._segTs) >>> 0;
+    if (this._segTs !== null && ev.event === this._segEvent &&
+        this._segDur === 0xFFFF && gap >= 0xFFFF && gap < 0x20000) {
+      this._carry += gap;
+    } else {
+      this._carry = 0;
+    }
+    this._segTs = ts;
+    this._segEvent = ev.event;
+  }
+  this._segDur = ev.duration;
+
   if (ev.end) {
-    var ts = pkt.timestamp >>> 0;
     if (this._lastEndTs === ts) return;      // end-packet retransmit
     this._lastEndTs = ts;
     this._output({ tone: ev.tone, event: ev.event, volume: ev.volume,
-                   duration: ev.duration, timestamp: ts });
+                   duration: this._carry + ev.duration,
+                   timestamp: (ts - this._carry) >>> 0 });   // the event's start
   }
 };
 
@@ -177,12 +256,17 @@ DTMFDepacketizer.prototype.depacketize = function (pkt) {
  *  parity with every other codec's depacketizer. */
 DTMFDepacketizer.prototype.reset = function () {
   this._lastEndTs = null;
+  this._lastEndRaw = null;
+  this._segTs = null;
+  this._segEvent = -1;
+  this._segDur = 0;
+  this._carry = 0;
 };
 
 /** Release resources. Safe to call multiple times; depacketize() after
  *  close() is silently ignored. Interface parity with the other codecs. */
 DTMFDepacketizer.prototype.close = function () {
-  this._lastEndTs = null;
+  this.reset();
   this._output = null;
 };
 

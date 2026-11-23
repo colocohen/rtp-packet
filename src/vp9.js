@@ -201,10 +201,44 @@ function readDescriptor(payload, out) {
       out.sid = (li >> 1) & 0x07;
     }
     hdrLen++;
+    // Non-flexible mode (F = 0): TL0PICIDX follows the layer indices
+    // (RFC 9628 §4.2). It was not skipped, and went up as the frame's
+    // first byte.
+    // NOT CHECKED AGAINST ANOTHER IMPLEMENTATION: Chrome always sends
+    // flexible mode (SVC included), pion's payloader never sets L. Written
+    // from the RFC's text and tested with packets built by hand to it.
+    if (!F) hdrLen++;
   }
   if (F && out.inter) {
-    while (hdrLen < payload.length && !(payload[hdrLen] & 0x01)) hdrLen++;
-    hdrLen++;
+    // Reference indices: P_DIFF (7 bits) | N, up to 3 of them; N=1 means
+    // another one follows. (The loop ran while N was 0 — so it went past
+    // Chrome's single P_DIFF into the frame itself, up to a byte that
+    // happened to have its low bit set.)
+    var nDiff = 0, pd;
+    do {
+      if (hdrLen >= payload.length) return false;
+      pd = payload[hdrLen++];
+      nDiff++;
+    } while ((pd & 0x01) && nDiff < 3);
+  }
+  if (desc & 0x02) {
+    // V: the scalability structure (§4.2.1), on a keyframe's first packet
+    // in what Chrome sends. N_S (3) | Y | G | 3 reserved; Y: N_S+1 pairs of
+    // 16-bit width and height; G: N_G, then per picture T (3) | U | R (2) |
+    // 2 reserved and R P_DIFF bytes. (It was not read at all: its bytes
+    // were handed up as the start of the frame, and no keyframe decoded.)
+    if (hdrLen >= payload.length) return false;
+    var ss = payload[hdrLen++];
+    var nS = (ss >> 5) + 1;
+    if (ss & 0x10) hdrLen += 4 * nS;
+    if (ss & 0x08) {
+      if (hdrLen >= payload.length) return false;
+      var nG = payload[hdrLen++];
+      for (var g = 0; g < nG; g++) {
+        if (hdrLen >= payload.length) return false;
+        hdrLen += 1 + ((payload[hdrLen] >> 2) & 0x03);
+      }
+    }
   }
 
   out.hdrLen = hdrLen;

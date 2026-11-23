@@ -233,6 +233,20 @@ function SrtpSession(arg1, arg2, arg3) {
 // ═══════════════════════════════════════════════════════════════════
 
 /**
+ * RFC 3711 §3.3.1 / libsrtp srtp_index_guess: the ROC that puts `seq`
+ * closest to `maxIndex` (the highest index seen on this SSRC). Used by
+ * both directions so sender and receiver agree on reordered packets.
+ */
+function _guessRoc(maxIndex, seq) {
+  var roc = Math.floor(maxIndex / 0x10000);
+  var lastSeq = maxIndex & 0xFFFF;
+  if (lastSeq < 0x8000) {
+    return (seq - lastSeq > 0x8000) ? Math.max(0, roc - 1) : roc;
+  }
+  return (lastSeq - 0x8000 > seq) ? (roc + 1) >>> 0 : roc;
+}
+
+/**
  * Encrypt an RTP packet → SRTP packet.
  * @param {Buffer} rtpPacket
  * @returns {Buffer|null}
@@ -243,15 +257,17 @@ SrtpSession.prototype.encryptRtp = function (rtpPacket) {
   var seq  = rtpPacket.readUInt16BE(2);
   var ssrc = rtpPacket.readUInt32BE(8);
 
-  // Sender index: strictly monotonic. Guess the ROC from the previous
-  // max index — a wrap is detected when the new (roc, seq) pair with the
-  // same ROC would move the index backwards past the wrap threshold.
+  // Sender index: guessed exactly like the receiver does (the ROC that puts
+  // seq nearest the highest index sent so far), and maxIndex only moves
+  // forward. Before, the ROC came from maxIndex's low bits with a one-way
+  // "wrap" test and maxIndex was then raised to whatever index that gave:
+  // one packet forwarded out of order across the wrap (65535 after 1) got
+  // ROC+1, became the new maximum, and every later packet got ROC+2 — the
+  // receiver could never decrypt the stream again.
   var st = this._sendState[ssrc];
   var roc, index;
   if (st) {
-    roc = Math.floor(st.maxIndex / 0x10000);
-    var lastSeq = st.maxIndex & 0xFFFF;
-    if (seq < 0x8000 && lastSeq > 0xC000) roc = (roc + 1) >>> 0;
+    roc = _guessRoc(st.maxIndex, seq);
     index = roc * 0x10000 + seq;
     if (index > st.maxIndex) st.maxIndex = index;
   } else {
@@ -310,18 +326,7 @@ SrtpSession.prototype.decryptRtp = function (srtpPacket) {
   // incoming seq closest to the highest authenticated index. This makes
   // LATE packets that straddle a wraparound decrypt with roc-1 instead
   // of failing auth, and EARLY packets just past a wrap use roc+1.
-  var guessRoc;
-  if (st) {
-    var roc = Math.floor(st.maxIndex / 0x10000);
-    var lastSeq = st.maxIndex & 0xFFFF;
-    if (lastSeq < 0x8000) {
-      guessRoc = (seq - lastSeq > 0x8000) ? Math.max(0, roc - 1) : roc;
-    } else {
-      guessRoc = (lastSeq - 0x8000 > seq) ? (roc + 1) >>> 0 : roc;
-    }
-  } else {
-    guessRoc = 0;
-  }
+  var guessRoc = st ? _guessRoc(st.maxIndex, seq) : 0;
   var index = guessRoc * 0x10000 + seq;
 
   var headerLen = _rtpHeaderLength(srtpPacket);
@@ -342,6 +347,11 @@ SrtpSession.prototype.decryptRtp = function (srtpPacket) {
   } else {
     // ── RFC 3711: verify HMAC, then AES-CM decrypt ──
     var authTagStart = srtpPacket.length - AUTH_TAG_LEN;
+    // A header (CC / extension length) that runs into the tag: the GCM branch
+    // above already refused it, this one went on to _view() with a negative
+    // length and threw a RangeError — out of handleIncomingRtp, from one
+    // packet of an authenticated peer.
+    if (headerLen > authTagStart) return null;
 
     // HMAC-SHA1 over (authenticated || ROC), assembled in a reused buffer
     var macIn = this._macScratch;
@@ -691,10 +701,16 @@ function _buildRtpIv(iv, salt, ssrc, packetIndex) {
   iv[6] ^= (ssrc >>> 8) & 0xFF;
   iv[7] ^= ssrc & 0xFF;
 
+  // The 48-bit index is ROC (32 bits) || SEQ (16 bits), times 2^16: the
+  // ROC takes bytes 8-11, the SEQ bytes 12-13. (The ROC was written to
+  // bytes 8-9, 16 bits up: every packet after the first seq wrap was
+  // encrypted with a keystream libsrtp and browsers do not use.)
   var hi = (packetIndex / 0x10000) >>> 0;
   var lo = packetIndex & 0xFFFF;
-  iv[8]  ^= (hi >>> 8) & 0xFF;
-  iv[9]  ^= hi & 0xFF;
+  iv[8]  ^= (hi >>> 24) & 0xFF;
+  iv[9]  ^= (hi >>> 16) & 0xFF;
+  iv[10] ^= (hi >>> 8) & 0xFF;
+  iv[11] ^= hi & 0xFF;
   iv[12] ^= (lo >>> 8) & 0xFF;
   iv[13] ^= lo & 0xFF;
 }

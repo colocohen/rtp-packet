@@ -19,8 +19,9 @@
  *      H.265:  [F:1 | Type:6 | LayerId:6 | TID:3]                  (16 bits)
  *
  *      H.265 type field is 6 bits → 0..63. Important values:
- *        19 = IDR_W_RADL    } both are IDR frames (keyframes);
- *        20 = IDR_N_LP      } either constitutes a new RAP point
+ *        16..18 = BLA     }
+ *        19, 20 = IDR     } IRAP pictures (keyframes): each one is a
+ *        21     = CRA     } point a decoder can start from
  *        32 = VPS           Video Parameter Set
  *        33 = SPS           Sequence Parameter Set
  *        34 = PPS           Picture Parameter Set
@@ -69,9 +70,15 @@ import {
 var CLOCK_RATE = 90000;
 var START_CODE_4 = Buffer.from([0, 0, 0, 1]);
 
-// NAL types we care about (RFC 7798 §1.1.4 + Table 7-1 in HEVC spec).
-var NAL_IDR_W_RADL = 19;
-var NAL_IDR_N_LP   = 20;
+// A keyframe is any IRAP picture, NAL types 16..23 (H.265 §7.4.2.2): BLA
+// (16-18), IDR (19, 20), CRA (21) and the reserved IRAP types 22-23. Only
+// 19/20 used to count, so x265's default open GOP (IDR first, CRA for every
+// keyframe after it) was all 'delta' after the first frame: a decoder that
+// lost its place waited for a key that never came. libwebrtc's H265
+// depacketizer marks the same set (video_rtp_depacketizer_h265.cc).
+function _isIrap(type) {
+  return type >= 16 && type <= 23;
+}
 var NAL_AP         = 48;
 var NAL_FU         = 49;
 
@@ -87,9 +94,13 @@ var NAL_FU         = 49;
  * @param {number}  opts.payloadType              required, 0-127
  * @param {number} [opts.mtu]                     default 1400
  * @param {number} [opts.initialSequenceNumber]   default random
+ * @param {string} [opts.format]                  the chunks' framing, as WebCodecs' hevc.format:
+ *                                                'annexb' (start codes) or 'hevc' (4-byte
+ *                                                lengths). Unset: told from the data.
  */
 function H265Packetizer(opts) {
   initPacketizer(this, opts);
+  this._format = _checkFormat(this, opts.format, 'hevc');
 }
 
 /**
@@ -98,7 +109,7 @@ function H265Packetizer(opts) {
  * @param {Buffer[]} [chunk.nalus]      pre-split NALUs (alternative to data, avoids re-splitting)
  * @param {number}   chunk.timestamp    microseconds
  * @param {string}   [chunk.type]       'key' | 'delta' — informational; H.265 keyframes are
- *                                       detected by NAL types 19/20 (IDR_W_RADL/IDR_N_LP)
+ *                                       detected by IRAP NAL types 16-23 (BLA/IDR/CRA)
  * @returns {Buffer[]}
  */
 H265Packetizer.prototype.packetize = function (chunk) {
@@ -177,7 +188,7 @@ function _packetize(self, chunk, withMeta) {
       nalus[k] = _toBuffer(chunk.nalus[k]);
     }
   } else {
-    nalus = _splitNALUs(_toBuffer(chunk.data));
+    nalus = _splitNALUs(_toBuffer(chunk.data), self._format);
   }
   if (!nalus.length) return [];
 
@@ -267,7 +278,8 @@ function H265Depacketizer(opts) {
   this._fuFragments = [];  // in-flight FU fragments
   this._fuHdrHi = 0;       // reconstructed NAL header byte 0 for in-progress FU
   this._fuHdrLo = 0;       // reconstructed NAL header byte 1
-  this._sawIDR = false;    // true if any NALU in this AU was IDR (type 19/20)
+  this._sawIDR = false;    // true if any NALU in this AU was IRAP (types 16-23)
+  this._ts = null;         // RTP timestamp of the access unit being built
 }
 
 /**
@@ -278,10 +290,10 @@ function H265Depacketizer(opts) {
  * H264Depacketizer.peekKeyframe with two adaptations:
  *
  *   - NAL header is 2 bytes; type field is bits 1..6 of byte 0.
- *   - Keyframes are NAL types 19 (IDR_W_RADL) or 20 (IDR_N_LP).
+ *   - Keyframes are IRAP NAL types 16-23 (BLA, IDR, CRA; see _isIrap).
  *
  *   Single NAL (types 0..47, except 48/49/50/63):
- *     The NAL header IS the first 2 bytes of the payload. Type = 19 or 20.
+ *     The NAL header IS the first 2 bytes of the payload. Type = 16..23.
  *
  *   AP (type 48):
  *     2-byte aggregation header, then repeated [16-bit length | NALU].
@@ -302,7 +314,7 @@ H265Depacketizer.peekKeyframe = function (payload) {
   // Single NAL — type 0..47 (excluding the special types). For the
   // common case, just check the type byte directly.
   if (naluType < NAL_AP) {
-    return naluType === NAL_IDR_W_RADL || naluType === NAL_IDR_N_LP;
+    return _isIrap(naluType);
   }
 
   if (naluType === NAL_AP) {
@@ -318,7 +330,7 @@ H265Depacketizer.peekKeyframe = function (payload) {
       if (off + size > payload.length) return false;   // truncated
       if (size >= 2) {
         var aggType = (payload[off] >> 1) & 0x3F;
-        if (aggType === NAL_IDR_W_RADL || aggType === NAL_IDR_N_LP) return true;
+        if (_isIrap(aggType)) return true;
       }
       off += size;
     }
@@ -334,7 +346,7 @@ H265Depacketizer.peekKeyframe = function (payload) {
     var startBit = !!(fuByte & 0x80);
     if (!startBit) return false;       // mid/end fragment carries no useful info
     var origType = fuByte & 0x3F;
-    return origType === NAL_IDR_W_RADL || origType === NAL_IDR_N_LP;
+    return _isIrap(origType);
   }
 
   // PACI (50) and reserved/extension types — treat as no-info.
@@ -345,6 +357,20 @@ H265Depacketizer.prototype.depacketize = function (packet) {
   // minLen 2: the H265 NAL header itself is two bytes — anything shorter
   // (including zero-length padding probes) carries nothing parseable.
   if (!checkDepacketizePayload(this, packet, 2)) return;
+
+  // A new RTP timestamp is a new access unit (RFC 6184 §5.1 / RFC 7798
+  // §4.1: all packets of one AU share it). When the previous AU's marker
+  // packet was lost, its NALUs used to stay in _nalus and went out at the
+  // head of THIS AU: a slice of the old picture glued into the new one (and
+  // the whole AU typed 'key' when the lost one was an IDR). The incomplete
+  // AU is dropped instead, as libwebrtc's packet buffer drops a frame it
+  // cannot complete; a half-built FU from it goes with it.
+  if (this._ts !== null && packet.timestamp !== this._ts) {
+    this._nalus = [];
+    this._fuFragments = [];
+    this._sawIDR = false;
+  }
+  this._ts = packet.timestamp;
 
   var payload = packet.payload;
   var naluType = (payload[0] >> 1) & 0x3F;
@@ -364,7 +390,7 @@ H265Depacketizer.prototype.depacketize = function (packet) {
       this._nalus.push(nalu);
       if (size >= 2) {
         var t = (nalu[0] >> 1) & 0x3F;
-        if (t === NAL_IDR_W_RADL || t === NAL_IDR_N_LP) this._sawIDR = true;
+        if (_isIrap(t)) this._sawIDR = true;
       }
       off += size;
     }
@@ -402,13 +428,13 @@ H265Depacketizer.prototype.depacketize = function (packet) {
       this._fuFragments = [];
       this._nalus.push(fullNalu);
       var t2 = (fullNalu[0] >> 1) & 0x3F;
-      if (t2 === NAL_IDR_W_RADL || t2 === NAL_IDR_N_LP) this._sawIDR = true;
+      if (_isIrap(t2)) this._sawIDR = true;
     }
 
   } else if (naluType < NAL_AP) {
     // Single NAL unit (regular video/parameter-set NALU).
     this._nalus.push(payload);
-    if (naluType === NAL_IDR_W_RADL || naluType === NAL_IDR_N_LP) this._sawIDR = true;
+    if (_isIrap(naluType)) this._sawIDR = true;
 
   } else {
     // PACI (50) and other extension types not handled. We skip rather
@@ -423,6 +449,7 @@ H265Depacketizer.prototype.depacketize = function (packet) {
     var isKey = this._sawIDR;
     this._nalus = [];
     this._sawIDR = false;
+    this._ts = null;
     this._output({
       data: accessUnit,
       timestamp: packet.timestamp,
@@ -437,6 +464,7 @@ H265Depacketizer.prototype.reset = function () {
   this._fuHdrHi = 0;
   this._fuHdrLo = 0;
   this._sawIDR = false;
+  this._ts = null;
 };
 
 H265Depacketizer.prototype.close = function () {
@@ -451,22 +479,27 @@ H265Depacketizer.prototype.close = function () {
 //  (Identical to h264.js — H.265 uses the same Annex-B framing)
 // ═══════════════════════════════════════════════════════════════════
 
-function _splitNALUs(buf) {
-  // Auto-detect framing, mirroring h264.js: Annex-B start codes vs.
-  // length-prefixed (hvcC / MP4 / WebCodecs "hevc" format — 4-byte
-  // big-endian lengths). Fall back to the Annex-B splitter, which
-  // treats unframed input as a single NALU (previous behavior).
-  if (!_startsWithStartCode(buf)) {
-    var lp = _trySplitLengthPrefixed(buf);
-    if (lp) return lp;
-  }
+function _splitNALUs(buf, format) {
+  // The packetizer's `format` ('annexb' / 'hevc'), or auto-detect the
+  // framing, mirroring h264.js: Annex-B start codes vs. length-prefixed
+  // (hvcC / MP4 / WebCodecs "hevc" format — 4-byte big-endian lengths).
+  // The strict length walk goes first: a leading 00 00 01 is also the
+  // length of a NALU of 256-511 bytes, which went to the Annex-B splitter
+  // (see h264.js). Fall back to the Annex-B splitter, which treats
+  // unframed input as a single NALU (previous behavior).
+  if (format === 'annexb') return _splitAnnexB(buf);
+  var lp = _trySplitLengthPrefixed(buf);
+  if (lp) return lp;
   return _splitAnnexB(buf);
 }
 
-function _startsWithStartCode(buf) {
-  if (buf.length >= 3 && buf[0] === 0 && buf[1] === 0 && buf[2] === 1) return true;
-  if (buf.length >= 4 && buf[0] === 0 && buf[1] === 0 && buf[2] === 0 && buf[3] === 1) return true;
-  return false;
+/** opts.format: 'annexb', or the length-prefixed name (`lp`), or unset. */
+function _checkFormat(self, format, lp) {
+  if (format == null) return null;
+  if (format !== 'annexb' && format !== lp) {
+    throw new TypeError(self.constructor.name + ': opts.format must be "annexb" or "' + lp + '"');
+  }
+  return format;
 }
 
 function _trySplitLengthPrefixed(buf) {
@@ -489,14 +522,18 @@ function _trySplitLengthPrefixed(buf) {
 function _splitAnnexB(buf) {
   var nalus = [];
   var i = 0, len = buf.length;
+  var found = false;
 
   while (i < len - 3) {
     if (buf[i] === 0 && buf[i + 1] === 0) {
-      if (buf[i + 2] === 1) { i += 3; break; }
-      if (i < len - 3 && buf[i + 2] === 0 && buf[i + 3] === 1) { i += 4; break; }
+      if (buf[i + 2] === 1) { i += 3; found = true; break; }
+      if (i < len - 3 && buf[i + 2] === 0 && buf[i + 3] === 1) { i += 4; found = true; break; }
     }
     i++;
   }
+  // No start code: unframed input, the whole buffer is one NALU. (The
+  // scan above leaves i at the end, and only the last 3 bytes went out.)
+  if (!found) return len > 0 ? [buf] : [];
   var naluStart = i;
 
   while (i < len - 3) {
