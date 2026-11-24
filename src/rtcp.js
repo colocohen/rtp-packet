@@ -159,6 +159,10 @@ function buildREMB(senderSsrc, mediaSsrcs, bitrate) {
   // BR mantissa and exponent: bitrate = mantissa × 2^exp
   var exp = 0;
   var mantissa = Math.floor(bitrate);
+  // Infinity used to hang here: the halving loop below never ends on it.
+  // A negative bitrate (or NaN) wrote a mantissa of garbage bits. Neither
+  // is an estimate; both become 0.
+  if (!(mantissa > 0) || mantissa === Infinity) mantissa = 0;
   // Halve with arithmetic, not `>>= 1`: the shift works on int32, so from
   // 2^31 bps up the mantissa came out negative or wrapped (2^31 -> 0,
   // 5 Gbps -> 705 Mbps).
@@ -226,9 +230,13 @@ function buildTransportCC(opts) {
   // Reference time is 24-bit signed, in 64ms units. Truncate input ms to
   // the nearest 64ms boundary so the first packet's delta is always ≥0.
   var refUnits = Math.floor(opts.referenceTimeMs / 64);
-  // Clamp to 24-bit signed range (-0x800000 .. 0x7FFFFF).
-  if (refUnits > 0x7FFFFF)  refUnits = 0x7FFFFF;
-  if (refUnits < -0x800000) refUnits = -0x800000;
+  // The field is the low 24 bits: it wraps (draft §3.1: an absolute time in
+  // the sender's time base; the receiver compares consecutive reference
+  // times modulo 2^24, as libwebrtc does). This used to clamp to the signed
+  // range instead, so any wall-clock input (Date.now() / 64 is ~2^34) wrote
+  // 0x7FFFFF in every feedback and the remote could not place one feedback's
+  // arrivals against the next. `& 0xFFFFFF` after ToInt32 is exact modulo
+  // 2^24 for every integer up to 2^53.
   var refTime24 = refUnits & 0xFFFFFF;
 
   // Pass 1: build per-packet symbol array and collect deltas
@@ -240,27 +248,45 @@ function buildTransportCC(opts) {
   var symbols = new Array(packetCount);
   var deltas  = [];   // byte-level encoded recv deltas, appended in order
 
+  // The remote rebuilds arrival times as refTime + the sum of the deltas, so
+  // each delta is quantized against the running *quantized* time, not on its
+  // own: rounding every delta separately let the error add up (packets 1.1ms
+  // apart were each sent as 1.0ms, 10ms off after 100 packets). A delta out
+  // of range drops its packet (reported lost) without moving the quantized
+  // time, so the next one covers the gap instead of starting from a time
+  // the remote never saw.
+  // The deltas count from the caller's referenceTimeMs, but the field holds
+  // it rounded down to 64ms: start the running time at the difference, or
+  // every arrival the remote rebuilds is early by up to 64ms.
+  // (A missing or non-finite referenceTimeMs gives NaN here: start at 0.)
+  var cumUs = (opts.referenceTimeMs - refUnits * 64) * 1000;   // exact time of the current packet, µs after the written refTime
+  if (!(cumUs >= 0 && cumUs < 64000)) cumUs = 0;
+  var sentQ = 0;      // quantized time of the last packet written, 250µs units
+
   for (var i = 0; i < packetCount; i++) {
     var p = packets[i];
     if (!p || !p.received) {
       symbols[i] = 0;
       continue;
     }
-    var deltaUs = p.deltaUs | 0;
+    cumUs += p.deltaUs | 0;
     // Quantize to 250µs units per draft §3.1.5
-    var deltaQ = Math.round(deltaUs / 250);
+    var deltaQ = Math.round(cumUs / 250) - sentQ;
 
     if (deltaQ >= 0 && deltaQ <= 0xFF) {
       // Small delta: 1 unsigned byte
       symbols[i] = 1;
       deltas.push({ size: 1, value: deltaQ });
+      sentQ += deltaQ;
     } else if (deltaQ >= -0x8000 && deltaQ <= 0x7FFF) {
       // Large delta: 2 bytes signed
       symbols[i] = 2;
       deltas.push({ size: 2, value: deltaQ });
+      sentQ += deltaQ;
     } else {
       // Out of representable range (> ~8s gap). Report as not received —
-      // the remote will treat this packet as lost. In practice this
+      // the remote will treat this packet as lost (sentQ stays, see
+      // above). In practice this
       // only happens if the caller delays building feedback past ~8s,
       // which is already far beyond useful for congestion control.
       symbols[i] = 0;
@@ -489,16 +515,21 @@ function parseRTCP(buf) {
         result.reason = buf.subarray(reasonOff + 1, reasonOff + 1 + rLen).toString('utf8');
       }
     }
-  } else if (type === 201 && buf.length >= 32) {
+  } else if (type === 201 && buf.length >= 8) {
+    // An RR with no report blocks (RC=0, 8 bytes) is valid and common —
+    // Chrome sends one when it receives no media. It used to need 32 bytes,
+    // and came back unnamed.
     result.name = 'RR';
     result.ssrc = buf.readUInt32BE(4);
-    result.mediaSsrc = buf.readUInt32BE(8);
-    result.fractionLost = buf[12];
-    result.totalLost = (buf[13] << 16) | (buf[14] << 8) | buf[15];
-    result.highestSeq = buf.readUInt32BE(16);
-    result.jitter = buf.readUInt32BE(20);
-    result.lastSR = buf.readUInt32BE(24);
-    result.delaySinceLastSR = buf.readUInt32BE(28);
+    if (buf.length >= 32) {
+      result.mediaSsrc = buf.readUInt32BE(8);
+      result.fractionLost = buf[12];
+      result.totalLost = (buf[13] << 16) | (buf[14] << 8) | buf[15];
+      result.highestSeq = buf.readUInt32BE(16);
+      result.jitter = buf.readUInt32BE(20);
+      result.lastSR = buf.readUInt32BE(24);
+      result.delaySinceLastSR = buf.readUInt32BE(28);
+    }
     // Also surface all report blocks (spec allows up to 31). Consumers that
     // want to match a specific SSRC can iterate result.reports[]. The first
     // block is also surfaced via the flat fields above for back-compat.
@@ -744,8 +775,20 @@ function generateSDP(opts) {
  * @param {string} cname — canonical name (e.g., 'user@host' or random UUID)
  * @returns {Buffer}
  */
+// UTF-8 bytes of `s`, cut to at most `max` bytes at a character boundary.
+// An SDES item's and a BYE reason's length is ONE byte: a longer string had
+// its length written mod 256 (300 bytes as 44), and the rest of the text was
+// read as further items.
+function _utf8Upto(s, max) {
+  var b = Buffer.from(s, 'utf8');
+  if (b.length <= max) return b;
+  var end = max;
+  while (end > 0 && (b[end] & 0xC0) === 0x80) end--;   // don't split a character
+  return b.subarray(0, end);
+}
+
 function buildSDES(ssrc, cname) {
-  var cnameBytes = Buffer.from(cname, 'utf8');
+  var cnameBytes = _utf8Upto(cname, 255);
   // Item: type=1 (CNAME), length, value
   var itemLen = 2 + cnameBytes.length;
   // Chunk = SSRC(4) + item + null terminator, padded to 4-byte boundary
@@ -771,7 +814,7 @@ function buildSDES(ssrc, cname) {
  * @returns {Buffer}
  */
 function buildBYE(ssrcs, reason) {
-  var reasonBytes = reason ? Buffer.from(reason, 'utf8') : null;
+  var reasonBytes = reason ? _utf8Upto(reason, 255) : null;
   var reasonLen = reasonBytes ? 1 + reasonBytes.length : 0;  // length byte + string
   var paddedReasonLen = reasonBytes ? ((reasonLen + 3) & ~3) : 0;
   var totalLen = 4 + ssrcs.length * 4 + paddedReasonLen;

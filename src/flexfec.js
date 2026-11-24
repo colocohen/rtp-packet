@@ -146,16 +146,32 @@ FlexFecEncoder.prototype.setGroupSize = function (n) {
 
 /**
  * Feed one outgoing media RTP packet (serialized, pre-SRTP). Returns an
- * array with a FEC packet when the group completes, else [].
+ * array with a FEC packet when the group completes, else [] — two when the
+ * packet does not fit the open group's mask (that group's FEC, then this
+ * one's when groupSize is 1).
  */
 FlexFecEncoder.prototype.protect = function (rtpBuffer) {
   var buf = Buffer.isBuffer(rtpBuffer) ? rtpBuffer : Buffer.from(rtpBuffer);
   if (buf.length < FIXED_HDR) return [];
   var ssrc = buf.readUInt32BE(8);
   if (ssrc !== this._protectedSsrc) return [];
-  this._group.push({ seq: _u16(buf[2], buf[3]), buf: _zeroMutable(buf, this._mutable) });
-  if (this._group.length >= this._groupSize) return [this._buildFec()];
-  return [];
+  var seq = _u16(buf[2], buf[3]);
+  var out = [];
+  // The mask names the group's packets by their distance from the first
+  // one, 0..108. A packet it cannot name — before the first, 109 or more
+  // after it (a loss gap kept by an SFU forwarder), or a seq already in the
+  // group — closes the group, and starts the next. It used to join anyway:
+  // XORed into the FEC with no mask bit (bits[] past 108 is dropped), or
+  // XORed twice, so every packet recovered from that FEC was wrong.
+  if (this._group.length) {
+    var d = _seqDiff(seq, this._group[0].seq);
+    var fits = d >= 1 && d <= 108;
+    for (var i = 1; fits && i < this._group.length; i++) if (this._group[i].seq === seq) fits = false;
+    if (!fits) out.push(this._buildFec());
+  }
+  this._group.push({ seq: seq, buf: _zeroMutable(buf, this._mutable) });
+  if (this._group.length >= this._groupSize) out.push(this._buildFec());
+  return out;
 };
 
 /** Emit a FEC packet for a partial group (e.g. at end of frame burst). */

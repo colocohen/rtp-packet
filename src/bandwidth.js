@@ -88,7 +88,7 @@ function parseTransportCC(fci) {
   //   0 = not received
   //   1 = received small delta (1 byte)
   //   2 = received large delta (2 bytes)
-  //   3 = received without delta
+  //   3 = reserved (draft §3.1.3): the feedback is malformed
   var symbols = [];
   var off = 8;
   while (symbols.length < packetCount) {
@@ -126,9 +126,14 @@ function parseTransportCC(fci) {
     var seq = (baseSeq + i) & 0xFFFF;
     var sym = symbols[i];
 
-    if (sym === 0 || sym === 3) {
-      // Not received (0) or received without delta (3)
-      packets.push({ seq: seq, received: sym !== 0, deltaUs: null });
+    if (sym === 3) {
+      // The two-bit symbol 11 is reserved (draft §3.1.3). It used to be read
+      // as "received, no delta", a meaning the draft does not give it; the
+      // feedback is rejected instead, as libwebrtc does.
+      return null;
+    }
+    if (sym === 0) {
+      packets.push({ seq: seq, received: false, deltaUs: null });
       continue;
     }
 
@@ -262,10 +267,17 @@ function BandwidthEstimator(opts) {
  *  times to compute per-packet delay. */
 BandwidthEstimator.prototype.recordSend = function (transportSeq, sendTimeMs, sizeBytes) {
   if (transportSeq == null) return;
+  // Feedback carries 16-bit seqs: a wider number would never be looked up.
+  transportSeq = transportSeq & 0xFFFF;
+  // A seq recorded again (a resend under the same seq) updates its entry in
+  // place. Pushing it on the order list a second time let the older copy's
+  // eviction delete the fresh entry early.
+  var known = transportSeq in this._sendHistory;
   this._sendHistory[transportSeq] = {
     sendTimeMs: sendTimeMs != null ? sendTimeMs : Date.now(),
     sizeBytes:  sizeBytes  || 0,
   };
+  if (known) return;
   this._sendHistoryOrder.push(transportSeq);
   if (this._sendHistoryOrder.length > this._sendHistoryMax) {
     var evict = this._sendHistoryOrder.shift();
@@ -275,7 +287,9 @@ BandwidthEstimator.prototype.recordSend = function (transportSeq, sendTimeMs, si
 
 /** Called on REMB arrival. Use it as a ceiling hint. */
 BandwidthEstimator.prototype.observeRemb = function (bitrateBps) {
-  if (typeof bitrateBps !== 'number' || bitrateBps <= 0) return;
+  // `!(x > 0)` also turns away NaN, which `x <= 0` let through to make the
+  // estimate NaN for good.
+  if (typeof bitrateBps !== 'number' || !(bitrateBps > 0)) return;
   // Sanity floor: REMB values below 10 kbps are almost certainly
   // a bug in the remote or a parsing error — a real WebRTC stream
   // needs ≥30 kbps even for lowest-quality audio. Ignore them so
@@ -531,14 +545,17 @@ TransportCCFeedbackGenerator.prototype.buildFeedback = function () {
   // look up arrival. If not present → not received.
   var packets = new Array(packetCount);
   var ai = 0;                      // index into sorted arrivals
-  var prevArrivalMs = refTimeMs;
+  // Deltas are taken between arrival times rounded to µs from refTime, so
+  // their sum is each arrival's own rounded time (rounding each difference
+  // on its own let up to 0.5µs per packet add up).
+  var prevUs = 0;
 
   for (var i = 0; i < packetCount; i++) {
     var seqI = arrs[0].seq + i;
     if (ai < arrs.length && arrs[ai].seq === seqI) {
-      var delta = Math.round((arrs[ai].timeMs - prevArrivalMs) * 1000); // µs
-      packets[i] = { received: true, deltaUs: delta };
-      prevArrivalMs = arrs[ai].timeMs;
+      var atUs = Math.round((arrs[ai].timeMs - refTimeMs) * 1000);
+      packets[i] = { received: true, deltaUs: atUs - prevUs };   // µs
+      prevUs = atUs;
       ai++;
     } else {
       packets[i] = { received: false, deltaUs: null };

@@ -147,7 +147,12 @@ JitterBuffer.prototype.push = function (pkt) {
 };
 
 JitterBuffer.prototype._store = function (seq, pkt) {
-  if (this._buffer[seq] === undefined) this._count++;
+  // A seq already buffered keeps its first arrival. The duplicate (an RTX
+  // recovery and the late original, a network duplicate) used to replace
+  // it with a fresh insertTime, and the gap before it then waited a full
+  // latency again from the duplicate before being declared lost.
+  if (this._buffer[seq] !== undefined) return;
+  this._count++;
   this._buffer[seq] = { pkt: pkt, insertTime: Date.now() };
 
   // Enforce maxSize: if the buffer is over capacity, the head of the
@@ -184,14 +189,18 @@ JitterBuffer.prototype._flush = function () {
     var entry = this._buffer[this._nextSeq];
 
     if (entry) {
-      // Packet available — emit it
+      // Packet available — emit it. The position moves past it BEFORE the
+      // callbacks: one that pushes back into the buffer (and so may
+      // force-advance and flush) used to find the head missing and declare
+      // this very packet lost, and the +1 after it then skipped from
+      // wherever that nested flush had left the position.
       delete this._buffer[this._nextSeq];
       this._count--;
       this._emittedAny = true;
-      if (this._output) this._output(entry.pkt);
-      this._ee.emit('packet', entry.pkt);
       this._nextSeq = (this._nextSeq + 1) & 0xFFFF;
       emitted++;
+      if (this._output) this._output(entry.pkt);
+      this._ee.emit('packet', entry.pkt);
     } else {
       // Packet missing — check if we've waited long enough
       var nextEntry = this._findNextAvailable();
@@ -212,11 +221,15 @@ JitterBuffer.prototype._flush = function () {
  * Declare every seq in [_nextSeq, gapEnd) lost (bounded) and jump.
  */
 JitterBuffer.prototype._declareGapAndSkip = function (gapEnd) {
-  var gapLen = _seqDiff(gapEnd, this._nextSeq);
+  var from = this._nextSeq;
+  var gapLen = _seqDiff(gapEnd, from);
   if (gapLen < 0) { this._nextSeq = gapEnd; return; }   // shouldn't happen
+  // Jump BEFORE the callbacks, as in _flush: one that pushes (and so may
+  // flush) used to see the same gap and declare it lost a second time.
+  this._nextSeq = gapEnd;
 
   var toReport = Math.min(gapLen, MAX_LOSS_EVENTS_PER_GAP);
-  var s = this._nextSeq;
+  var s = from;
   for (var i = 0; i < toReport; i++) {
     var lostSeq = s & 0xFFFF;
     if (this._onLoss) this._onLoss(lostSeq);
@@ -226,9 +239,8 @@ JitterBuffer.prototype._declareGapAndSkip = function (gapEnd) {
   if (gapLen > toReport) {
     // Discontinuity too large to enumerate — surface as one event so
     // the caller can request a keyframe instead of NACKing thousands.
-    this._ee.emit('gap', { from: this._nextSeq, to: gapEnd, length: gapLen });
+    this._ee.emit('gap', { from: from, to: gapEnd, length: gapLen });
   }
-  this._nextSeq = gapEnd;
 };
 
 /**

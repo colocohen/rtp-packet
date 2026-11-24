@@ -139,28 +139,41 @@ H265Packetizer.prototype.packetizeWithMeta = function (chunk) {
  * @returns {Buffer}
  */
 H265Packetizer.prototype.packetizeAP = function (nalus, timestampUs, marker) {
-  if (!nalus || !nalus.length) {
+  // Normalize each NALU to Buffer locally without mutating the caller's
+  // array. One shorter than its 2-byte header is no NAL unit and is left
+  // out (it went out as such, a zero size among them).
+  var localNalus = [];
+  if (nalus) {
+    for (var ll = 0; ll < nalus.length; ll++) {
+      var nb = _toBuffer(nalus[ll]);
+      if (nb && nb.length >= 2) localNalus.push(nb);
+    }
+  }
+  if (!localNalus.length) {
     throw new TypeError('H265Packetizer.packetizeAP: nalus array required');
   }
-  // Normalize each NALU to Buffer locally without mutating the caller's array.
-  var localNalus = new Array(nalus.length);
-  for (var ll = 0; ll < nalus.length; ll++) localNalus[ll] = _toBuffer(nalus[ll]);
 
-  // Compute totals. Aggregation NAL header is 2 bytes; each aggregated
-  // NALU is preceded by its own 2-byte length field.
+  // The AP's payload header (RFC 7798 §4.4.2): F set when any aggregated
+  // NALU's F is, Type 48, LayerId and TID the LOWEST of the aggregated
+  // NALUs'. (It took LayerId/TID from the first NALU and always wrote F=0.)
+  // NAL header: [F:1 | Type:6 | LayerId(hi):1] [LayerId(lo):5 | TID:3]
+  var fBit = 0, layerId = 63, tid = 7;
   var totalSize = 2;
-  for (var i = 0; i < localNalus.length; i++) totalSize += 2 + localNalus[i].length;
-
-  // The aggregation NAL header takes its layer/TID from the FIRST NALU
-  // (RFC 7798 §4.4.2). We zero F (forbidden_zero_bit) per spec, set
-  // Type=48 (AP), and copy LayerId/TID from the first aggregated NALU.
-  var firstHdrHi = localNalus[0][0];
-  var firstHdrLo = localNalus[0].length > 1 ? localNalus[0][1] : 0;
-  // Original layout: [F:1 | Type:6 | LayerId(hi):1] [LayerId(lo):5 | TID:3]
-  // Replace Type field (bits 1..6 of high byte) with 48 (AP).
-  // High byte becomes: (F=0, Type=48, LayerId hi bit from firstHdrLo top)
-  var apHdrHi = (NAL_AP << 1) | (firstHdrHi & 0x01);
-  var apHdrLo = firstHdrLo;
+  for (var i = 0; i < localNalus.length; i++) {
+    var n = localNalus[i];
+    // The size field is 16 bits; a longer NALU made writeUInt16BE throw
+    // Node's generic out-of-range error.
+    if (n.length > 0xFFFF) {
+      throw new RangeError('H265Packetizer.packetizeAP: a NALU of ' + n.length + ' bytes does not fit in an AP (65535 at most)');
+    }
+    fBit |= n[0] & 0x80;
+    var lid = ((n[0] & 0x01) << 5) | (n[1] >> 3);
+    if (lid < layerId) layerId = lid;
+    if ((n[1] & 0x07) < tid) tid = n[1] & 0x07;
+    totalSize += 2 + n.length;
+  }
+  var apHdrHi = fBit | (NAL_AP << 1) | (layerId >> 5);
+  var apHdrLo = ((layerId & 0x1F) << 3) | tid;
 
   var payload = Buffer.allocUnsafe(totalSize);
   payload[0] = apHdrHi;
@@ -190,6 +203,10 @@ function _packetize(self, chunk, withMeta) {
   } else {
     nalus = _splitNALUs(_toBuffer(chunk.data), self._format);
   }
+  // A NALU shorter than its 2-byte header is no NAL unit: it went out as a
+  // packet every receiver drops (ours too: minLen 2), and took the marker
+  // with it when it was the last one. It is left out.
+  nalus = nalus.filter(function (n) { return n.length >= 2; });
   if (!nalus.length) return [];
 
   var rtpTs = usToRtp(chunk.timestamp, CLOCK_RATE);
@@ -448,6 +465,10 @@ H265Depacketizer.prototype.depacketize = function (packet) {
     var accessUnit = _joinAnnexB(this._nalus);
     var isKey = this._sawIDR;
     this._nalus = [];
+    // A FU still open at the marker belongs to this access unit, which is
+    // done: it was kept, and with _ts cleared the next AU's fragments
+    // (their start lost) were appended to it and went out as one NALU.
+    this._fuFragments = [];
     this._sawIDR = false;
     this._ts = null;
     this._output({
@@ -535,6 +556,10 @@ function _splitAnnexB(buf) {
   // scan above leaves i at the end, and only the last 3 bytes went out.)
   if (!found) return len > 0 ? [buf] : [];
   var naluStart = i;
+  // trailing_zero_8bits (H.265 B.2) between a NALU and the next start code
+  // are not part of it — a NAL unit's last byte is never 0x00 (7.4.2.1).
+  // They went out at the end of the NALU.
+  var end;
 
   while (i < len - 3) {
     if (buf[i] === 0 && buf[i + 1] === 0) {
@@ -542,7 +567,9 @@ function _splitAnnexB(buf) {
       if (buf[i + 2] === 1) scLen = 3;
       else if (i < len - 3 && buf[i + 2] === 0 && buf[i + 3] === 1) scLen = 4;
       if (scLen > 0) {
-        if (i > naluStart) nalus.push(buf.subarray(naluStart, i));
+        end = i;
+        while (end > naluStart && buf[end - 1] === 0) end--;
+        if (end > naluStart) nalus.push(buf.subarray(naluStart, end));
         i += scLen;
         naluStart = i;
         continue;
@@ -550,7 +577,9 @@ function _splitAnnexB(buf) {
     }
     i++;
   }
-  if (naluStart < len) nalus.push(buf.subarray(naluStart, len));
+  end = len;
+  while (end > naluStart && buf[end - 1] === 0) end--;
+  if (end > naluStart) nalus.push(buf.subarray(naluStart, end));
   return nalus;
 }
 

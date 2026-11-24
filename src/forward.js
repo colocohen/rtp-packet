@@ -62,7 +62,60 @@ function RtpForwarder(opts) {
   this._pendingTsJump = 0;
 
   this._forwarded = 0;
+
+  // Packets this consumer deliberately did not get (a layer above its
+  // ceiling), by input seq, since the last re-base. Output numbering
+  // closes up over them: a gap the viewer sees is a loss it NACKs and
+  // then waits on, and a packet the SFU chose to drop will never come.
+  this._drops = [];
+  this._highestIn = null;      // newest input seq seen (forwarded or dropped)
+  this._dropped = 0;
 }
+
+// Drops further back than this are folded into the offset: a packet that
+// late is past any reordering, and the list stays short.
+var DROP_WINDOW = 512;
+
+RtpForwarder.prototype._foldOldDrops = function () {
+  while (this._drops.length && seqDelta(this._highestIn, this._drops[0]) > DROP_WINDOW) {
+    this._drops.shift();
+    this._seqOffset = (this._seqOffset + 1) | 0;
+  }
+};
+
+// How many dropped packets come before input seq `inSeq` — the amount
+// its output number moves down by.
+RtpForwarder.prototype._shiftFor = function (inSeq) {
+  var n = this._drops.length;
+  if (!n) return 0;
+  // In order (the normal case): newer than every drop.
+  if (seqDelta(inSeq, this._drops[n - 1]) > 0) return n;
+  var k = 0;
+  for (var i = 0; i < n; i++) if (seqDelta(inSeq, this._drops[i]) > 0) k++;
+  return k;
+};
+
+/**
+ * The SFU is not forwarding this packet to this consumer (spatial or
+ * temporal layer above its ceiling). Later output sequence numbers close
+ * up over it, so the viewer sees a contiguous stream instead of a loss.
+ * (mediasoup's SeqManager does the same with its dropped set.)
+ *
+ * A drop before anything was forwarded, or while a re-base is pending,
+ * needs no bookkeeping: the next forwarded packet anchors the numbering.
+ * A drop of a packet OLDER than one already seen (reordered) is not
+ * tracked: it would renumber packets already sent.
+ */
+RtpForwarder.prototype.drop = function (pkt) {
+  if (!pkt || pkt.length < 12) return;
+  this._dropped++;
+  if (this._seqOffset === null || this._pendingSwitch) return;
+  var inSeq = (pkt[2] << 8) | pkt[3];
+  if (this._highestIn !== null && seqDelta(inSeq, this._highestIn) <= 0) return;
+  this._highestIn = inSeq;
+  this._drops.push(inSeq);
+  this._foldOldDrops();
+};
 
 /**
  * Announce that the NEXT packet comes from a different source timeline
@@ -98,6 +151,7 @@ RtpForwarder.prototype.forward = function (pkt) {
     // First packet ever: anchor so that out = startSeq / startTs.
     this._seqOffset = seqDelta(inSeq, this._startSeq);
     this._tsOffset  = tsDelta(inTs, this._startTs) | 0;
+    this._drops = [];
   } else if (this._pendingSwitch) {
     // Re-base: the new source's arbitrary seq/ts must land exactly at
     // (lastOut+1, lastOutTs+jump). Deltas WITHIN the new source are
@@ -107,9 +161,15 @@ RtpForwarder.prototype.forward = function (pkt) {
     var wantTs  = (this._lastOutTs + this._pendingTsJump) >>> 0;
     this._seqOffset = seqDelta(inSeq, wantSeq);
     this._tsOffset  = tsDelta(inTs, wantTs) | 0;
+    this._drops = [];
+    this._highestIn = null;
   }
 
-  var outSeq = (inSeq - this._seqOffset) & 0xFFFF;
+  if (this._highestIn === null || seqDelta(inSeq, this._highestIn) > 0) {
+    this._highestIn = inSeq;
+    this._foldOldDrops();
+  }
+  var outSeq = (inSeq - this._seqOffset - this._shiftFor(inSeq)) & 0xFFFF;
   var outTs  = ((inTs - this._tsOffset) >>> 0);
 
   var out = Buffer.from(pkt);                        // copy — never mutate the shared receive buffer
@@ -141,6 +201,7 @@ RtpForwarder.prototype.getState = function () {
     ssrc: this._ssrc,
     payloadType: this._pt,
     forwarded: this._forwarded,
+    dropped: this._dropped,
     lastOutputSeq: this._lastOutSeq,
     lastOutputTimestamp: this._lastOutTs,
   };

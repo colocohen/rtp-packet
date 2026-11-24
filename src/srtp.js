@@ -253,6 +253,10 @@ function _guessRoc(maxIndex, seq) {
  */
 SrtpSession.prototype.encryptRtp = function (rtpPacket) {
   if (!rtpPacket || rtpPacket.length < 12) return null;
+  // Before the index is taken: a packet whose header runs past its end was
+  // refused after its SSRC's send state had moved to its sequence number.
+  var headerLen = _rtpHeaderLength(rtpPacket);
+  if (headerLen > rtpPacket.length) return null;
 
   var seq  = rtpPacket.readUInt16BE(2);
   var ssrc = rtpPacket.readUInt32BE(8);
@@ -276,8 +280,6 @@ SrtpSession.prototype.encryptRtp = function (rtpPacket) {
     this._sendState[ssrc] = { maxIndex: index };
   }
 
-  var headerLen = _rtpHeaderLength(rtpPacket);
-  if (headerLen > rtpPacket.length) return null;
   var len = rtpPacket.length;
 
   if (this._gcm) {
@@ -488,10 +490,18 @@ SrtpSession.prototype._decryptRtcpGcm = function (srtcpPacket) {
   srtcpPacket.copy(this._aadScratch, 0, 0, 8);
   this._aadScratch.writeUInt32BE(indexWord, 8);
 
-  // For unencrypted-but-authenticated packets (E=0), the "ciphertext"
-  // region is still covered by the tag as AAD-style data. We only
-  // support E=1 for GCM here — WebRTC always encrypts RTCP.
-  if (!isEncrypted) return null;
+  if (!isEncrypted) {
+    // E=0, tagged but not encrypted (RFC 7714 §9.3, the §17.3 vector): the
+    // whole RTCP packet and the ESRTCP word are the AAD, the plaintext is
+    // empty — packet | tag | ESRTCP. (Every such packet was refused, "WebRTC
+    // always encrypts RTCP"; a sender may choose not to, RFC 3711 §3.4.)
+    var aad0 = Buffer.allocUnsafe(tagStart + 4);
+    srtcpPacket.copy(aad0, 0, 0, tagStart);
+    aad0.writeUInt32BE(indexWord, tagStart);
+    if (this._decRtcpGcm.decrypt_sync(this._iv12, _view(srtcpPacket, tagStart, indexStart), _view(aad0, 0, aad0.length)) === null) return null;
+    if (!this._srtcpReplayOk(ssrc, index)) return null;
+    return Buffer.from(srtcpPacket.subarray(0, tagStart));
+  }
   var out = Buffer.allocUnsafe(tagStart);
   // null when the tag does not verify
   if (this._decRtcpGcm.decrypt_into_sync(out, 8, this._iv12, _view(srtcpPacket, 8, indexStart), this._aadView) === null) return null;

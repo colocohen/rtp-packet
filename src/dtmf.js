@@ -104,12 +104,22 @@ DtmfPacketizer.prototype._nextSegment = function () {
   }
 };
 
+// The time an update adds: a finite number, not negative. (A negative one
+// made writeUInt16BE throw Node's generic range error; NaN made the elapsed
+// time NaN for the rest of the event, every duration written as 0.)
+function _checkDelta(fn, ms) {
+  if (typeof ms !== 'number' || !(ms >= 0) || ms === Infinity) {
+    throw new RangeError('DtmfPacketizer.' + fn + ': the time must be a finite number of ms, not negative');
+  }
+}
+
 /**
  * Emit one update packet, advancing elapsed time by deltaMs.
  * Returns a single serialized RTP packet (Buffer).
  */
 DtmfPacketizer.prototype.update = function (deltaMs, opts) {
   if (this._eventCode === null) throw new Error('DtmfPacketizer: no active event');
+  _checkDelta('update', deltaMs);
   // A segment that already went out full (0xFFFF) is over: this packet
   // belongs to the next one.
   if (this._elapsedTicks >= 0xFFFF) this._nextSegment();
@@ -138,7 +148,10 @@ DtmfPacketizer.prototype.update = function (deltaMs, opts) {
 DtmfPacketizer.prototype.endEvent = function (finalDeltaMs, opts) {
   if (this._eventCode === null) throw new Error('DtmfPacketizer: no active event');
   if (this._elapsedTicks >= 0xFFFF) this._nextSegment();
-  if (finalDeltaMs) this._elapsedTicks += Math.round(finalDeltaMs * this.clockRate / 1000);
+  if (finalDeltaMs) {
+    _checkDelta('endEvent', finalDeltaMs);
+    this._elapsedTicks += Math.round(finalDeltaMs * this.clockRate / 1000);
+  }
   var out = [];
   // Ending past the segment's limit: report it full first, then end in the next.
   if (this._elapsedTicks > 0xFFFF) {

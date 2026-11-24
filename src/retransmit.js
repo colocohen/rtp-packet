@@ -343,7 +343,10 @@ NackThrottle.prototype.shouldSend = function (ssrc, seq) {
   var key = ssrc + ':' + seq;
   var now = Date.now();
   var last = this._lastSent[key];
-  if (last && (now - last) < this._windowMs) return false;
+  // undefined, not falsy, is "never sent": a send at time 0 (a clock that
+  // starts there) passed for none, and the same packet went out again at
+  // once — the bug NackGenerator had with sentAt === 0.
+  if (last !== undefined && (now - last) < this._windowMs) return false;
   this._lastSent[key] = now;
 
   // Occasional sweep — keep the map size bounded in long sessions.

@@ -85,19 +85,40 @@ H264Packetizer.prototype.packetizeWithMeta = function (chunk) {
  * @returns {Buffer}
  */
 H264Packetizer.prototype.packetizeStapA = function (nalus, timestampUs, marker) {
-  if (!nalus || !nalus.length) {
+  // Normalize each NALU to Buffer locally without mutating the caller's
+  // array. An empty one is no NAL unit (it has no header) and is left out:
+  // it went out as a zero size, which a receiver reads as malformed.
+  var localNalus = [];
+  if (nalus) {
+    for (var i = 0; i < nalus.length; i++) {
+      var nb = _toBuffer(nalus[i]);
+      if (nb && nb.length > 0) localNalus.push(nb);
+    }
+  }
+  if (!localNalus.length) {
     throw new TypeError('H264Packetizer.packetizeStapA: nalus array required');
   }
-  // Normalize each NALU to Buffer locally without mutating the caller's array.
-  var localNalus = new Array(nalus.length);
-  for (var i = 0; i < nalus.length; i++) localNalus[i] = _toBuffer(nalus[i]);
 
-  var nri = (localNalus[0][0] >> 5) & 0x03;
+  // RFC 6184 §5.7: the STAP's NRI MUST be the maximum of the aggregated
+  // NALUs' NRIs, and its F bit set when any of theirs is. (It took the
+  // first NALU's NRI and dropped F: an SPS+PPS bundle led by a lower-NRI
+  // unit was marked less important than what it carries.)
+  var nri = 0, fBit = 0;
   var totalSize = 1;
-  for (var ii = 0; ii < localNalus.length; ii++) totalSize += 2 + localNalus[ii].length;
+  for (var ii = 0; ii < localNalus.length; ii++) {
+    var h = localNalus[ii][0];
+    // The size field is 16 bits; a longer NALU made writeUInt16BE throw
+    // Node's generic out-of-range error.
+    if (localNalus[ii].length > 0xFFFF) {
+      throw new RangeError('H264Packetizer.packetizeStapA: a NALU of ' + localNalus[ii].length + ' bytes does not fit in a STAP-A (65535 at most)');
+    }
+    fBit |= h & 0x80;
+    if (((h >> 5) & 0x03) > nri) nri = (h >> 5) & 0x03;
+    totalSize += 2 + localNalus[ii].length;
+  }
 
   var payload = Buffer.allocUnsafe(totalSize);
-  payload[0] = (nri << 5) | 24;  // STAP-A type = 24
+  payload[0] = fBit | (nri << 5) | 24;  // STAP-A type = 24
   var off = 1;
   for (var j = 0; j < localNalus.length; j++) {
     payload.writeUInt16BE(localNalus[j].length, off); off += 2;
@@ -116,9 +137,13 @@ function _packetize(self, chunk, withMeta) {
   // the chunk (WebCodecs chunks are frozen / read-only per spec).
   var nalus;
   if (chunk.nalus) {
-    nalus = new Array(chunk.nalus.length);
+    // An empty NALU is left out: it went out as an RTP packet with no
+    // payload, which no receiver can read as a NAL unit (and the marker
+    // was lost with it when it was the last one).
+    nalus = [];
     for (var k = 0; k < chunk.nalus.length; k++) {
-      nalus[k] = _toBuffer(chunk.nalus[k]);
+      var nk = _toBuffer(chunk.nalus[k]);
+      if (nk.length > 0) nalus.push(nk);
     }
   } else {
     nalus = _splitNALUs(_toBuffer(chunk.data), self._format);
@@ -143,9 +168,10 @@ function _packetize(self, chunk, withMeta) {
 
 function _fragmentFUA(self, nalu, rtpTs, isLastNalu, withMeta, out) {
   var naluHeader = nalu[0];
-  var nri = (naluHeader >> 5) & 0x03;
   var naluType = naluHeader & 0x1F;
-  var fuIndicator = (nri << 5) | 28;  // FU-A type = 28
+  // F and NRI of the NAL unit go in the FU indicator (RFC 6184 §5.8: they
+  // carry its header octet; only NRI was copied, so an F=1 unit lost F).
+  var fuIndicator = (naluHeader & 0xE0) | 28;  // FU-A type = 28
   var maxPayload = self.mtu - 2;       // -2 for the FU indicator + FU header
   var dataStart = 1;                   // skip the original NAL header byte
   var dataEnd = nalu.length;
@@ -323,7 +349,10 @@ H264Depacketizer.prototype.depacketize = function (packet) {
     var type = fuHeader & 0x1F;
 
     if (startBit) {
-      this._fuHeader = (payload[0] & 0x60) | type;        // reconstruct NAL header (F+NRI from indicator, type from FU header)
+      // Reconstruct the NAL header: F+NRI from the indicator, type from the
+      // FU header (RFC 6184 §5.8). The mask was 0x60, NRI only, so a NAL
+      // unit marked F=1 (errors) came out clean.
+      this._fuHeader = (payload[0] & 0xE0) | type;
       // A reassembled NALU is kept as [headerByte, payload, payload, ...]
       // — the whole FU-A payloads, their 2-byte FU prefix skipped when
       // _joinAnnexB copies them into the access unit. Concatenating here
@@ -356,6 +385,10 @@ H264Depacketizer.prototype.depacketize = function (packet) {
     var accessUnit = _joinAnnexB(this._nalus);
     var isKey = this._sawIDR;
     this._nalus = [];
+    // A FU still open at the marker belongs to this access unit, which is
+    // done: it was kept, and with _ts cleared the next AU's fragments
+    // (their start lost) were appended to it and went out as one NALU.
+    this._fuFragments = [];
     this._sawIDR = false;
     this._ts = null;
 
@@ -466,6 +499,10 @@ function _splitAnnexB(buf) {
   // scan above leaves i at the end, and only the last 3 bytes went out.)
   if (!found) return len > 0 ? [buf] : [];
   var naluStart = i;
+  // trailing_zero_8bits (H.264 B.1) between a NALU and the next start code
+  // are not part of it — a NAL unit's last byte is never 0x00 (7.4.1). They
+  // went out at the end of the NALU.
+  var end;
 
   while (i < len - 3) {
     if (buf[i] === 0 && buf[i + 1] === 0) {
@@ -473,7 +510,9 @@ function _splitAnnexB(buf) {
       if (buf[i + 2] === 1) scLen = 3;
       else if (i < len - 3 && buf[i + 2] === 0 && buf[i + 3] === 1) scLen = 4;
       if (scLen > 0) {
-        if (i > naluStart) nalus.push(buf.subarray(naluStart, i));
+        end = i;
+        while (end > naluStart && buf[end - 1] === 0) end--;
+        if (end > naluStart) nalus.push(buf.subarray(naluStart, end));
         i += scLen;
         naluStart = i;
         continue;
@@ -481,7 +520,9 @@ function _splitAnnexB(buf) {
     }
     i++;
   }
-  if (naluStart < len) nalus.push(buf.subarray(naluStart, len));
+  end = len;
+  while (end > naluStart && buf[end - 1] === 0) end--;
+  if (end > naluStart) nalus.push(buf.subarray(naluStart, end));
   return nalus;
 }
 

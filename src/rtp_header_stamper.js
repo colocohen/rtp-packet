@@ -79,11 +79,9 @@ import { setHeaderExtensions, transportCC, absSendTime, audioLevel } from './rtp
  *   extMap: {name: id, ...}   — map of known extension names → RFC-5285 IDs
  *                                (values come from SDP a=extmap: lines)
  *   mid:    string            — value to stamp for 'mid' extension (if mapped)
- *   rid:    string            — value to stamp for 'rtp-stream-id' extension
- *                                (RFC 8852, simulcast layer identifier)
- *   repairedRid: string       — value to stamp for 'repaired-rtp-stream-id'
- *                                (RFC 8852, RTX packets — identifies which
- *                                 source layer this retransmission repairs)
+ *   (RIDs are per SSRC: setRidForSsrc / setRtxRids. `rid` and
+ *    `repairedRid` used to be listed here, but the constructor never read
+ *    them.)
  *   initialTransportCcSeq: number  — starting counter (default: 0; wraps 16-bit)
  */
 function RtpHeaderStamper(opts) {
@@ -107,9 +105,13 @@ function RtpHeaderStamper(opts) {
   this._ridPayloadCache    = {};
   this._repairedRidPayloadCache = {};
 
-  // Pre-encode mid — constant for transceiver life.
+  // Pre-encode mid — constant for transceiver life. Every mid and RID is
+  // encoded as UTF-8: these used 'ascii' (each UTF-16 unit's low byte) while
+  // setMidForSsrc used 'utf8', so one non-ASCII mid went out as two different
+  // byte strings depending on where it was set. For the tokens the SDP
+  // allows (RFC 8843 / RFC 8851, ASCII) both give the same bytes.
   if (this._mid != null && this._extMap['mid'] != null) {
-    this._midPayload = Buffer.from(this._mid, 'ascii');
+    this._midPayload = Buffer.from(this._mid, 'utf8');
   }
 }
 
@@ -144,7 +146,13 @@ RtpHeaderStamper.prototype.stamp = function (rtpPacket, hints) {
   // extension emitted (spec-legal; receivers treat it as absent).
   var alId = this._extMap['audio-level'];
   if (alId != null && hints && hints.audioLevel != null) {
-    batch[alId] = audioLevel(hints.audioLevel & 0x7F, !!hints.voiceActivity);
+    // Clamped to the field's 0..127 (RFC 6464 §3: 127 is -127 dBov or
+    // quieter). `& 0x7F` wrapped instead: a level of 130 (near silence) was
+    // sent as 2 (near full scale), a negative one as quiet.
+    var lvl = hints.audioLevel | 0;
+    if (lvl < 0) lvl = 0;
+    if (lvl > 127) lvl = 127;
+    batch[alId] = audioLevel(lvl, !!hints.voiceActivity);
     any = true;
   }
 
@@ -215,7 +223,7 @@ RtpHeaderStamper.prototype.lastTransportCcSeq = function () {
 RtpHeaderStamper.prototype.setMid = function (mid) {
   this._mid = mid != null ? String(mid) : null;
   this._midPayload = (this._mid != null && this._extMap['mid'] != null)
-    ? Buffer.from(this._mid, 'ascii') : null;
+    ? Buffer.from(this._mid, 'utf8') : null;
 };
 
 /**
@@ -248,7 +256,7 @@ RtpHeaderStamper.prototype.setRidForSsrc = function (ssrc, rid) {
     delete this._ridPayloadCache[key];
   } else {
     this._ridBySsrc[key] = String(rid);
-    this._ridPayloadCache[key] = Buffer.from(String(rid), 'ascii');
+    this._ridPayloadCache[key] = Buffer.from(String(rid), 'utf8');
   }
 };
 
@@ -258,9 +266,11 @@ RtpHeaderStamper.prototype.setRidForSsrc = function (ssrc, rid) {
  * SSRC→RID entries from accumulating across transceiver lifecycles.
  */
 RtpHeaderStamper.prototype.clearSsrc = function (ssrc) {
-  delete this._midBySsrc[ssrc >>> 0];
+  // The null check comes first: the mid override was deleted before it, so
+  // clearSsrc(null) (null >>> 0 is 0) dropped SSRC 0's mid.
   if (ssrc == null) return;
   var key = ssrc >>> 0;
+  delete this._midBySsrc[key];
   delete this._ridBySsrc[key];
   delete this._ridPayloadCache[key];
   delete this._repairedRidBySsrc[key];
@@ -282,11 +292,11 @@ RtpHeaderStamper.prototype.setRtxRids = function (rtxSsrc, rid, repairedRid) {
   var key = rtxSsrc >>> 0;
   if (rid != null) {
     this._ridBySsrc[key] = String(rid);
-    this._ridPayloadCache[key] = Buffer.from(String(rid), 'ascii');
+    this._ridPayloadCache[key] = Buffer.from(String(rid), 'utf8');
   }
   if (repairedRid != null) {
     this._repairedRidBySsrc[key] = String(repairedRid);
-    this._repairedRidPayloadCache[key] = Buffer.from(String(repairedRid), 'ascii');
+    this._repairedRidPayloadCache[key] = Buffer.from(String(repairedRid), 'utf8');
   }
 };
 
@@ -298,7 +308,7 @@ RtpHeaderStamper.prototype.setExtMap = function (extMap) {
   // as the RID strings don't change. extMap changes only affect which
   // extensions are stamped, not the cached values.
   this._midPayload = (this._mid != null && this._extMap['mid'] != null)
-    ? Buffer.from(this._mid, 'ascii') : null;
+    ? Buffer.from(this._mid, 'utf8') : null;
 };
 
 

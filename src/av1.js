@@ -99,7 +99,11 @@ function _packetize(self, chunk, withMeta) {
       var room = maxPayload - cur.size;
       // Whole (rest of the) OBU if it fits, else the largest fragment that
       // does: len bytes cost leb128(len) + len.
-      var len = Math.min(rest, room - 1);
+      // A packet with no room for a length and one byte is full. (Filled
+      // exactly, it left room 0, and len came out -1: an element of length
+      // -1 went in — subarray(0, -1), leb128(-1) written as 0xFF — the packet
+      // went past the MTU, and the OBU's next part started at its last byte.)
+      var len = room >= 2 ? Math.min(rest, room - 1) : 0;
       while (len > 0 && _leb128Len(len) + len > room) len--;
       if (len === 0) {
         if (cur.els.length === 0) throw new Error('AV1Packetizer: mtu too small');

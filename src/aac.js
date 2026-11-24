@@ -433,7 +433,12 @@ AacDepacketizer.prototype._handleFragment = function (payload, dataStart, fragSi
   // fragment's announced AU size differs from the in-progress one
   // (which means we missed the end of the previous AU and a new one
   // started).
-  if (!this._fragments || this._expectedSize !== announcedSize) {
+  // Fragments of one AU share its RTP timestamp (RFC 3640 §3.2.3): a new
+  // one is a new AU. (Only the size was compared, so when the end of one AU
+  // was lost and the next had the same size — CBR — its fragments were
+  // appended to the old ones, and both went as a size mismatch.)
+  if (!this._fragments || this._expectedSize !== announcedSize ||
+      this._fragmentTimestamp !== packetTs) {
     if (this._fragments) {
       // We were mid-AU and got a fragment of a different AU. The
       // previous AU is lost; surface as an error and start fresh.

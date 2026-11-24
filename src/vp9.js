@@ -306,6 +306,19 @@ VP9Depacketizer.peekTemporalId = function (payload) {
   return _peekDesc.tid;
 };
 
+/**
+ * peekDescriptor — the whole payload descriptor of THIS packet, for an
+ * SFU doing spatial-layer (SVC) selection: sid/tid, B and E (start and
+ * end of the layer frame), P (inter-picture predicted). Written into
+ * `out` (a reused object), which is also returned; out.ok is false for a
+ * malformed or empty payload.
+ */
+VP9Depacketizer.peekDescriptor = function (payload, out) {
+  out = out || {};
+  readDescriptor(payload, out);
+  return out;
+};
+
 VP9Depacketizer.prototype.depacketize = function (packet) {
   if (!checkDepacketizePayload(this, packet, 1)) return;
 
