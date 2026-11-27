@@ -259,7 +259,37 @@ function BandwidthEstimator(opts) {
 
   // Delay-variation smoothing: exponential moving average of the trend.
   this._delayTrendMs = 0;
+
+  // Whether usable transport-cc feedback has arrived (a report with at least
+  // one pair of packets we know the send times of). With it, the estimate is
+  // ours (send-side, delay and loss based) and a REMB is only a ceiling on it
+  // (libwebrtc: SendSideBandwidthEstimation caps its estimate with the
+  // receiver's). Without it, REMB is the only rate signal there is.
+  this._tccActive = false;
+
+  // Loss-based control (draft-ietf-rmcat-gcc-02 §6), over windows of at least
+  // LOSS_WINDOW_PACKETS reported packets: the lost and the reported counts
+  // of the open window, and whether the last closed one held the estimate
+  // (loss between 2% and 10%: no increase until a window says otherwise).
+  this._lossLost = 0;
+  this._lossTotal = 0;
+  this._lossHold = false;
 }
+
+// Loss-based control (draft-ietf-rmcat-gcc-02 §6): a window of reported
+// packets whose loss fraction p is above LOSS_HIGH cuts the estimate to
+// estimate * (1 - 0.5 p); between LOSS_LOW and LOSS_HIGH it holds it (no
+// increase); below LOSS_LOW it lets it grow. RFC 8836 §4 asks a WebRTC
+// congestion controller to react to loss as well as to delay; the estimator
+// used to look at delay only, and a link losing half the packets with no
+// queue growth saw its estimate climb.
+var LOSS_WINDOW_PACKETS = 50;
+var LOSS_LOW  = 0.02;
+var LOSS_HIGH = 0.10;
+// Growth when an RR-only peer (no transport-cc) reports loss under LOSS_LOW:
+// GCC's loss-based controller grows by 8% per report; 5% here, the same
+// order, as the RR arrives about once a second.
+var LOSS_RR_GROWTH = 1.05;
 
 /** Record that we sent a packet with the given transport-wide sequence
  *  number. Call before or at the moment of send. The estimator uses
@@ -296,11 +326,45 @@ BandwidthEstimator.prototype.observeRemb = function (bitrateBps) {
   // the estimator doesn't get dragged to its floor by noise.
   if (bitrateBps < 10 * 1000) return;
   this._remoteRembBps = bitrateBps;
-  // Converge toward REMB but only by half each time — avoids thrash if
-  // REMB oscillates. Also clamp to bounds.
   var target = Math.min(bitrateBps, this._maxBps);
   target = Math.max(target, this._minBps);
+  if (this._tccActive) {
+    // A CEILING, not an estimate: with transport-cc the send-side estimate
+    // is the evidence, and REMB only caps it. Converging toward it (below)
+    // pulled the estimate up to whatever the peer advertised — 10 Mbps from
+    // a receiver that runs no REMB estimator of its own (this library's
+    // default) — in two REMBs, whatever the delay and loss said.
+    if (this._estimate > target) this._estimate = Math.round(target);
+    return;
+  }
+  // No transport-cc: REMB is the only rate signal. Converge toward it but
+  // only by half each time — avoids thrash if REMB oscillates.
   this._estimate = Math.round((this._estimate + target) / 2);
+};
+
+/**
+ * Loss reported by an RTCP receiver report block (RFC 3550 §6.4.1: the
+ * fraction lost, an 8-bit fixed point number, over the receiver's last
+ * reporting interval). Used only while no transport-cc feedback has come:
+ * transport-cc reports each loss already, and counting both would count
+ * every loss twice. The loss-based rule of draft-ietf-rmcat-gcc-02 §6 on
+ * the interval's fraction p: above 10% the estimate is cut to
+ * estimate * (1 - 0.5 p), below 2% it grows (LOSS_RR_GROWTH), between it
+ * holds. Bounded by a REMB seen and by the estimator's bounds.
+ *
+ * @param {number} fractionLost — the report block's field, 0..255
+ */
+BandwidthEstimator.prototype.observeReceiverReportLoss = function (fractionLost) {
+  if (this._tccActive) return;
+  if (typeof fractionLost !== 'number' || !(fractionLost >= 0)) return;
+  var p = Math.min(fractionLost, 255) / 256;
+  var next = this._estimate;
+  if (p > LOSS_HIGH) next = this._estimate * (1 - 0.5 * p);
+  else if (p < LOSS_LOW) next = this._estimate * LOSS_RR_GROWTH;
+  if (this._remoteRembBps > 0) next = Math.min(next, this._remoteRembBps);
+  next = Math.max(next, this._minBps);
+  next = Math.min(next, this._maxBps);
+  this._estimate = Math.round(next);
 };
 
 /** Called on transport-cc arrival. Observes delay variation. */
@@ -339,6 +403,23 @@ BandwidthEstimator.prototype.observeTransportCC = function (report) {
   }
 
   if (pairCount === 0) return;   // no usable data this cycle
+  this._tccActive = true;
+
+  // Loss: every packet the report describes counts, received or not
+  // (transport-cc names each one). A window closes once it holds
+  // LOSS_WINDOW_PACKETS; its fraction decides the loss-based limit below.
+  for (var il = 0; il < report.packets.length; il++) {
+    this._lossTotal++;
+    if (!report.packets[il].received) this._lossLost++;
+  }
+  var lossCut = null;
+  if (this._lossTotal >= LOSS_WINDOW_PACKETS) {
+    var pLoss = this._lossLost / this._lossTotal;
+    this._lossLost = 0;
+    this._lossTotal = 0;
+    this._lossHold = pLoss >= LOSS_LOW;
+    if (pLoss > LOSS_HIGH) lossCut = this._estimate * (1 - 0.5 * pLoss);
+  }
 
   var avgGradientUs = totalGradientUs / pairCount;
   // EMA the trend so we don't react to single noisy reports.
@@ -390,6 +471,11 @@ BandwidthEstimator.prototype.observeTransportCC = function (report) {
   var probeCap = actualBps > 0 ? (actualBps * 2) : Infinity;
   next = Math.min(next, Math.max(this._estimate, probeCap));
 
+  // Loss-based limit: the delay-based rate, capped by the loss rule (the
+  // smaller of the two, as GCC combines them). Held: no increase.
+  if (this._lossHold) next = Math.min(next, this._estimate);
+  if (lossCut !== null) next = Math.min(next, lossCut);
+
   // Respect REMB ceiling (if we have one) and absolute bounds.
   if (this._remoteRembBps > 0) next = Math.min(next, this._remoteRembBps);
   next = Math.max(next, this._minBps);
@@ -413,7 +499,113 @@ BandwidthEstimator.prototype.reset = function () {
   this._delayTrendMs  = 0;
   this._sendHistory   = Object.create(null);
   this._sendHistoryOrder = [];
+  this._tccActive     = false;
+  this._lossLost      = 0;
+  this._lossTotal     = 0;
+  this._lossHold      = false;
 };
+
+
+// ═══════════════════════════════════════════════════════════════════
+//  TMMBR bounding set (RFC 5104 §3.5.4.2)
+// ═══════════════════════════════════════════════════════════════════
+
+/**
+ * tmmbrBoundingSet — the TMMBR tuples that bound a media sender: RFC 5104
+ * §3.5.4.2's "Initial Algorithm", the one a media sender runs on the tuples
+ * it holds (the previous bounding set and the TMMBRs received since).
+ *
+ * Each tuple (maximum total media bit rate BR, per-packet overhead OH)
+ * limits the net media bit rate at packet rate PR to BR - PR * OH * 8; the
+ * bounding set is the lower envelope of those lines. The result is ordered
+ * by increasing overhead; each member carries `intersection` (the packet
+ * rate where it takes over from the previous member, 0 for the first) and
+ * `maxPacketRate` (where its line meets the X axis, or SMAXPR if lower).
+ *
+ * Edge cases the RFC leaves open: an overhead of 0 never meets the X axis
+ * (maxPacketRate Infinity, or SMAXPR); a bit rate of 0 meets it at 0.
+ *
+ * @param {Array<{ssrc, bitrate, overhead}>} tuples
+ * @param {number} [smaxpr]  session maximum packet rate (a=rtcp-fb ccm tmmbr
+ *                           smaxpr=, RFC 5104 §7.1), if any
+ * @returns {Array<{ssrc, bitrate, overhead, intersection, maxPacketRate}>}
+ */
+function tmmbrBoundingSet(tuples, smaxpr) {
+  if (!tuples || tuples.length === 0) return [];
+  var hasMax = typeof smaxpr === 'number' && smaxpr > 0;
+  function maxPr(t) {
+    // Equation (4): Max PR = BR / (8 * OH).
+    var pr = t.bitrate <= 0 ? 0 : (t.overhead <= 0 ? Infinity : t.bitrate / (8 * t.overhead));
+    return hasMax ? Math.min(smaxpr, pr) : pr;
+  }
+  // 1. Sort by increasing overhead (stable: ties keep their order).
+  var x = tuples.map(function (t, i) { return { t: t, i: i }; });
+  x.sort(function (a, b) { return (a.t.overhead - b.t.overhead) || (a.i - b.i); });
+  // 2. Equal overheads: keep only the lowest bit rate (the first of those).
+  var cand = [];
+  for (var k = 0; k < x.length; k++) {
+    var last = cand.length ? cand[cand.length - 1] : null;
+    if (last && last.overhead === x[k].t.overhead) {
+      if (x[k].t.bitrate < last.bitrate) cand[cand.length - 1] = x[k].t;
+      continue;
+    }
+    cand.push(x[k].t);
+  }
+  // 3. The lowest bit rate starts the selected list (ties: the highest
+  // overhead, which is the last of them in overhead order).
+  var first = 0;
+  for (var j = 1; j < cand.length; j++) {
+    if (cand[j].bitrate <= cand[first].bitrate) first = j;
+  }
+  function member(t, intersection) {
+    return { ssrc: t.ssrc, bitrate: t.bitrate, overhead: t.overhead,
+             intersection: intersection, maxPacketRate: maxPr(t) };
+  }
+  var y = [member(cand[first], 0)];
+  // 4. Discard the candidates with a lower overhead than the selected one.
+  cand = cand.slice(first + 1);
+  // 5-9.
+  for (var c = 0; c < cand.length; c++) {
+    var cur = cand[c];
+    var pr;
+    for (;;) {
+      var tail = y[y.length - 1];
+      // Equation (3), between the current candidate and the last selected
+      // tuple (the candidate's overhead is the higher one).
+      pr = (cur.bitrate - tail.bitrate) / (8 * (cur.overhead - tail.overhead));
+      // 7. At or before the last member's own intersection: that member is
+      // not on the envelope. The first is never dropped (step 3 makes its
+      // bit rate the lowest, so pr > 0 against it).
+      if (pr <= tail.intersection && y.length > 1) { y.pop(); continue; }
+      break;
+    }
+    // 8. Added only while the envelope is still above the X axis there.
+    if (pr > y[y.length - 1].intersection && pr < y[y.length - 1].maxPacketRate) {
+      y.push(member(cur, pr));
+    }
+  }
+  return y;
+}
+
+/**
+ * The net media bit rate a bounding set allows at packet rate `packetRate`
+ * (RFC 5104 §3.5.4.2, equations (1)/(2)): the lowest of BR - PR * OH * 8
+ * over its tuples, never below 0. An empty set: Infinity (no limit).
+ *
+ * @param {Array<{bitrate, overhead}>} boundingSet
+ * @param {number} packetRate  packets per second
+ * @returns {number} bps
+ */
+function tmmbrNetBitrate(boundingSet, packetRate) {
+  if (!boundingSet || boundingSet.length === 0) return Infinity;
+  var pr = packetRate > 0 ? packetRate : 0;
+  var best = Infinity;
+  for (var i = 0; i < boundingSet.length; i++) {
+    var v = boundingSet[i].bitrate - pr * boundingSet[i].overhead * 8;
+    if (v < best) best = v;
+  }
+  return best > 0 ? best : 0;
+}
 
 
 // ═══════════════════════════════════════════════════════════════════
@@ -609,4 +801,6 @@ export {
   parseREMB,
   BandwidthEstimator,
   TransportCCFeedbackGenerator,
+  tmmbrBoundingSet,
+  tmmbrNetBitrate,
 };

@@ -7,6 +7,7 @@
  *   - NACK (Generic NACK)     — type 205, fmt=1
  *   - PLI  (Picture Loss)     — type 206, fmt=1
  *   - FIR  (Full Intra Req)   — type 206, fmt=4
+ *   - TMMBR / TMMBN           — type 205, fmt=3 / fmt=4 (RFC 5104 §4.2)
  */
 
 /**
@@ -177,6 +178,88 @@ function buildREMB(senderSsrc, mediaSsrcs, bitrate) {
   }
 
   return buf;
+}
+
+
+/**
+ * The 6-bit exponent / 17-bit mantissa of a TMMBR / TMMBN bit rate
+ * (RFC 5104 §4.2.1.1: MxTBR = mantissa * 2^exp). The mantissa is the
+ * bit rate halved (rounded down) until it fits 17 bits: a requested limit
+ * is never encoded above itself. Non-finite, negative and NaN rates are 0;
+ * a rate past 131071 * 2^63 is that maximum.
+ */
+function _tmmbrMantExp(bitrate) {
+  var mantissa = Math.floor(bitrate);
+  if (!(mantissa > 0)) mantissa = 0;
+  if (mantissa === Infinity) return { exp: 63, mantissa: 0x1FFFF };
+  var exp = 0;
+  while (mantissa > 0x1FFFF) { mantissa = Math.floor(mantissa / 2); exp++; }
+  if (exp > 63) return { exp: 63, mantissa: 0x1FFFF };
+  return { exp: exp, mantissa: mantissa };
+}
+
+// One TMMBR / TMMBN FCI entry (RFC 5104 Figures 2 and 3): SSRC, then
+// MxTBR Exp (6) | MxTBR Mantissa (17) | Measured Overhead (9).
+function _writeTmmbEntry(buf, off, e) {
+  var me = _tmmbrMantExp(e.bitrate);
+  var oh = Math.floor(e.overhead);
+  if (!(oh > 0)) oh = 0;
+  if (oh > 511) oh = 511;
+  buf.writeUInt32BE(e.ssrc >>> 0, off);
+  buf[off + 4] = ((me.exp & 0x3F) << 2) | ((me.mantissa >> 15) & 0x03);
+  buf[off + 5] = (me.mantissa >> 7) & 0xFF;
+  buf[off + 6] = ((me.mantissa & 0x7F) << 1) | ((oh >> 8) & 0x01);
+  buf[off + 7] = oh & 0xFF;
+}
+
+function _buildTmmb(fmt, senderSsrc, entries) {
+  entries = entries || [];
+  var buf = Buffer.alloc(12 + entries.length * 8);
+  buf[0] = 0x80 | fmt;  // V=2, P=0, FMT
+  buf[1] = 205;         // RTPFB
+  buf.writeUInt16BE(2 + 2 * entries.length, 2);   // RFC 5104: 2 + 2*N
+  buf.writeUInt32BE(senderSsrc >>> 0, 4);
+  // "SSRC of media source" is not used and SHALL be 0 (§4.2.1.2, §4.2.2.2).
+  buf.writeUInt32BE(0, 8);
+  for (var i = 0; i < entries.length; i++) _writeTmmbEntry(buf, 12 + i * 8, entries[i]);
+  return buf;
+}
+
+/**
+ * Build a TMMBR (Temporary Maximum Media Stream Bit Rate Request, RFC 5104
+ * §4.2.1): RTPFB FMT=3.
+ * @param {number} senderSsrc — the requester (the media receiver)
+ * @param {Array<{ssrc, bitrate, overhead}>} entries — one per media sender
+ *        asked: its SSRC, the maximum total media bit rate (bps) and the
+ *        measured per-packet overhead (bytes, 0..511). One or more (SHALL).
+ * @returns {Buffer}
+ */
+function buildTMMBR(senderSsrc, entries) { return _buildTmmb(3, senderSsrc, entries); }
+
+/**
+ * Build a TMMBN (Temporary Maximum Media Stream Bit Rate Notification,
+ * RFC 5104 §4.2.2): RTPFB FMT=4. The entries are the bounding set; each
+ * SSRC is the OWNER of its tuple. Zero entries is valid (no bounding tuple).
+ * @param {number} senderSsrc — the media sender notifying
+ * @param {Array<{ssrc, bitrate, overhead}>} entries
+ * @returns {Buffer}
+ */
+function buildTMMBN(senderSsrc, entries) { return _buildTmmb(4, senderSsrc, entries); }
+
+// The FCI entries of a TMMBR / TMMBN, from offset 12. A trailing partial
+// entry is not read.
+function _parseTmmbEntries(buf) {
+  var entries = [];
+  for (var off = 12; off + 8 <= buf.length; off += 8) {
+    var exp = buf[off + 4] >> 2;
+    var mantissa = ((buf[off + 4] & 0x03) << 15) | (buf[off + 5] << 7) | (buf[off + 6] >> 1);
+    entries.push({
+      ssrc:     buf.readUInt32BE(off),
+      bitrate:  mantissa * Math.pow(2, exp),
+      overhead: ((buf[off + 6] & 0x01) << 8) | buf[off + 7],
+    });
+  }
+  return entries;
 }
 
 
@@ -460,6 +543,15 @@ function parseRTCP(buf) {
     result.senderSsrc = buf.readUInt32BE(4);
     result.mediaSsrc = buf.readUInt32BE(8);
     result.lostSequenceNumbers = _parseNackEntries(buf, 12);
+  } else if (type === 205 && (count === 3 || count === 4) && buf.length >= 12) {
+    // TMMBR (FMT=3) / TMMBN (FMT=4), RFC 5104 §4.2. The media SSRC field is
+    // unused (0); each FCI entry names its own SSRC: the media sender asked
+    // (TMMBR) or the owner of the tuple (TMMBN). A TMMBR SHALL hold one
+    // entry or more; one with none comes back with an empty list.
+    result.name = count === 3 ? 'TMMBR' : 'TMMBN';
+    result.senderSsrc = buf.readUInt32BE(4);
+    result.mediaSsrc  = buf.readUInt32BE(8);
+    result.entries    = _parseTmmbEntries(buf);
   } else if (type === 205 && count === 15 && buf.length >= 16) {
     // RTPFB transport-cc feedback (draft-holmer-rmcat-transport-wide-cc-
     // extensions-01). We only record that it IS transport-cc here;
@@ -856,4 +948,4 @@ function buildCompound(packets) {
 // the full original header (CSRCs + extension block), lives in
 // retransmit.js as buildRtxPacket / parseRtxPacket.
 
-export { buildSR, buildPLI, buildNACK, buildFIR, buildRR, buildREMB, buildTransportCC, buildSDES, buildBYE, buildCompound, parseRTCP, parseRTCPCompound, generateSDP };
+export { buildSR, buildPLI, buildNACK, buildFIR, buildRR, buildREMB, buildTMMBR, buildTMMBN, buildTransportCC, buildSDES, buildBYE, buildCompound, parseRTCP, parseRTCPCompound, generateSDP };

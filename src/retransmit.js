@@ -355,6 +355,18 @@ NackThrottle.prototype.shouldSend = function (ssrc, seq) {
   return true;
 };
 
+/**
+ * setWindowMs — the dedup window from now on. A sender's measured round
+ * trip, once it has one: libwebrtc's RtpPacketHistory refuses a second
+ * retransmission within one RTT of the last (VerifyRtt), and mediasoup's
+ * RtpStreamSend the same (100 ms until an RTT is measured). A request
+ * that comes later is the receiver's retry for a retransmission that was
+ * itself lost, and must be served.
+ */
+NackThrottle.prototype.setWindowMs = function (ms) {
+  if (typeof ms === 'number' && ms >= 0 && isFinite(ms)) this._windowMs = ms;
+};
+
 NackThrottle.prototype._evictExpired = function (now) {
   var cutoff = now - this._windowMs * 20;   // keep ~2s of history max
   var keys = Object.keys(this._lastSent);
